@@ -1,4 +1,4 @@
-import { writable } from 'svelte/store';
+import { get, writable } from 'svelte/store';
 import type { AppData, Progress, RuntimeHooks, Settings } from './types';
 import { GMRepository, loadSettings, saveSettings } from './lib/storage';
 import { Logger, sanitizeExport } from './lib/logs';
@@ -48,10 +48,12 @@ export function createController() {
   async function run(action: () => Promise<unknown>, notice: string) {
     if (busy) return;
     busy = true; pauseRequested = false;
-    view.update(value => ({ ...value, busy: true, error: '', notice: '' }));
+    view.update(value => ({ ...value, busy: true, error: '', notice: '',
+      progress: { phase: 'preparing', completed: 0, total: 0, message: '正在准备，请稍候…' } }));
     try { await action(); view.update(value => ({ ...value, notice })); }
     catch (error) {
-      const message = sanitizeExport(errorMessage(error), [settings.apiKey]); logger.add(message, error instanceof PauseError ? 'info' : 'error');
+      const message = sanitizeExport(`${errorMessage(error)}；当前步骤：${get(view).progress.message}`, [settings.apiKey]);
+      logger.add(message, error instanceof PauseError ? 'info' : 'error');
       view.update(value => ({ ...value, error: error instanceof PauseError ? '' : message,
         notice: error instanceof PauseError ? '已暂停；应用阶段可从已保存进度继续' : '' }));
     } finally { busy = false; pauseRequested = false; sync(); }

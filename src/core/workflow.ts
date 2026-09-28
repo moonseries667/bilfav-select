@@ -87,8 +87,10 @@ export class Workflow {
     const unavailableAids = new Set<number>();
     // Build locally and only replace the saved dataset after every source page
     // and every retryable metadata request has completed successfully.
+    let foldersRead = 0;
     for (const sourceId of this.data.state.sourceFolderIds) {
       this.checkpoint();
+      this.progress('scanning', foldersRead, this.data.state.sourceFolderIds.length, `正在扫描源收藏夹 ${foldersRead + 1}/${this.data.state.sourceFolderIds.length}（ID ${sourceId}）`);
       const folderVideos = await this.adapter.listFolderVideos(sourceId);
       const seenInFolder = new Set<number>();
       for (const video of folderVideos) {
@@ -105,12 +107,16 @@ export class Workflow {
           sourceVideos.set(video.aid, { video, sourceFolderIds: [sourceId], primarySourceFolderId: sourceId });
         }
       }
+      foldersRead++;
     }
 
+    this.hooks.log?.(`已扫描 ${foldersRead} 个源收藏夹，去重后 ${sourceVideos.size} 个视频；开始获取详情与完整标签`, 'info');
     const fetchedAt = this.now().toISOString();
     const videos: VideoRecord[] = [];
+    let metadataIndex = 0;
     for (const [aid, row] of sourceVideos) {
       this.checkpoint();
+      this.progress('metadata', metadataIndex, sourceVideos.size, `正在处理视频信息 ${++metadataIndex}/${sourceVideos.size}（aid ${aid}）`);
       if (unavailableAids.has(aid) || this.adapter.isVideoUnavailable?.(aid)) {
         unavailableAids.add(aid);
         continue;

@@ -283,6 +283,10 @@ export class HttpBilibiliAdapter implements BilibiliAdapter {
     while (hasMore) {
       if (pageNumber > MAX_RESOURCE_PAGES) throw new AppError('收藏夹页数异常，已停止以防返回不完整结果', 'invalid');
       this.hooks.checkpoint?.();
+      this.hooks.progress?.({
+        phase: 'scanning', completed: allRaw.length, total: expectedCount,
+        message: `正在读取收藏夹「${folder.title}」（ID ${id}）第 ${pageNumber} 页`,
+      });
       const page = await this.http.getData<ResourcePage>(makeApiUrl('/x/v3/fav/resource/list', {
         media_id: id,
         pn: pageNumber,
@@ -324,13 +328,17 @@ export class HttpBilibiliAdapter implements BilibiliAdapter {
           phase: 'scanning',
           completed: allRaw.length,
           total: expectedCount ?? folder.mediaCount,
-          message: `正在读取收藏夹第 ${pageNumber} 页`,
+          message: `已读取收藏夹「${folder.title}」（ID ${id}）第 ${pageNumber} 页`,
         });
       }
       pageNumber++;
     }
 
     if (allRaw.length !== expectedCount) {
+      this.hooks.progress?.({
+        phase: 'reconciling', completed: allRaw.length, total: expectedCount,
+        message: `收藏夹 ${id} 返回 ${allRaw.length}/${expectedCount} 项，正在核对完整 ID 列表`,
+      });
       await this.reconcileFolderResources(id, allRaw, expectedCount);
     }
 
@@ -497,17 +505,25 @@ export class HttpBilibiliAdapter implements BilibiliAdapter {
         [...returnedKeys].some(key => !byKey.has(key))) {
       throw new AppError('收藏夹分页与完整 ID 列表不一致，请重试扫描', 'invalid', undefined, true);
     }
-    for (const [key, media] of byKey) {
-      if (returnedKeys.has(key) || asFiniteNumber(media.type) !== 2) continue;
+    const missing = [...byKey].filter(([key, media]) => !returnedKeys.has(key) && asFiniteNumber(media.type) === 2);
+    let checked = 0;
+    for (const [, media] of missing) {
+      this.hooks.checkpoint?.();
       const aid = requiredPositiveInteger(media.id, '视频 aid');
-      if (this.unavailableAids.has(aid)) continue;
+      this.hooks.progress?.({
+        phase: 'reconciling', completed: checked, total: missing.length,
+        message: `正在核验收藏夹 ${id} 的缺失条目 ${checked + 1}/${missing.length}（aid ${aid}）`,
+      });
+      if (this.unavailableAids.has(aid)) { checked++; continue; }
       const bvid = asString(media.bvid, asString(media.bv_id));
       const metadata = await this.getVideoMetadata(aid, bvid || undefined);
       if (!metadata.unavailable) {
         // An available ID missing from pagination is a genuinely partial scan.
         throw new AppError(`收藏夹漏读了有效视频 ${aid}，请重试扫描`, 'invalid', undefined, true);
       }
+      checked++;
     }
+    this.hooks.progress?.({ phase: 'reconciling', completed: checked, total: missing.length, message: `收藏夹 ${id} 的缺失条目核验完成` });
     this.hooks.log?.(`收藏夹 ${id} 返回 ${resources.length}/${expectedCount} 项，已核对完整 ID 列表；失效视频跳过，可用视频继续处理`, 'info');
   }
 

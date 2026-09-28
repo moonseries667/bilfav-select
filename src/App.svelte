@@ -20,7 +20,8 @@
   const report = $derived(execution.verification);
   const progress = $derived($view.progress.total ? Math.min(100, Math.round($view.progress.completed / $view.progress.total * 100)) : 0);
   const resumable = $derived(!['idle', 'completed'].includes(execution.phase) && !!execution.runId);
-  const phaseLabels: Record<string, string> = { idle: '待运行', preparing: '准备', cleanup: '清理生成结果', creating: '建立新收藏夹', copying: '复制中', verifying: '校验中', paused: '已暂停', failed: '需恢复或重试', completed: '已完成' };
+  const phaseLabels: Record<string, string> = { idle: '待运行', scanning: '读取收藏夹', reconciling: '核验缺失条目', metadata: '获取视频信息', dataset: '信息已更新', classifying: 'AI 分类', preparing: '准备', cleanup: '清理生成结果', creating: '建立新收藏夹', copying: '复制中', verifying: '校验中', paused: '已暂停', failed: '需恢复或重试', completed: '已完成' };
+  const displayedPhase = $derived($view.busy ? $view.progress.phase : execution.phase);
   function date(value?: string) { return value ? new Date(value).toLocaleString('zh-CN') : '尚未运行'; }
   function close() { open = false; launcher?.focus(); }
   function save() {
@@ -109,7 +110,7 @@
 
       {#if $view.busy || execution.phase !== 'idle' || manifest}
         <section class="bf-section bf-results" aria-label="执行进度与结果">
-          <div class="bf-section-title"><h3>执行状态</h3><span class="bf-status">{phaseLabels[execution.phase] ?? execution.phase}</span></div>
+          <div class="bf-section-title"><h3>执行状态</h3><span class="bf-status">{phaseLabels[displayedPhase] ?? displayedPhase}</span></div>
           {#if $view.busy}<p class="bf-live" aria-live="polite">{$view.progress.message}</p><progress max="100" value={progress} aria-label="当前阶段进度"></progress><div class="bf-row"><span>{$view.progress.completed} / {$view.progress.total}</span><button class="bf-text-button" disabled={$view.pauseRequested} onclick={() => controller.pause()}>{$view.pauseRequested ? '正在暂停…' : '暂停并保存'}</button></div>{/if}
           {#if resumable && !$view.busy}<button class="bf-secondary bf-full" onclick={() => controller.resume()}>继续未完成执行（不调用 AI）</button>{/if}
           {#if manifest}<div class="bf-chips">{#each Object.entries(manifest.stats) as [name, count]}<span>{name}<strong>{count}</strong></span>{/each}</div>{/if}

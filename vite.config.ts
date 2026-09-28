@@ -13,7 +13,7 @@ export default defineConfig(({ command }) => ({
     userscript: {
       name: 'Bilibili 收藏夹语义重建器',
       namespace: 'bilfav-select',
-      version: '0.1.2',
+      version: '0.1.3',
       description: '冻结源收藏夹，按内容性质分类，只复制并校验，可中断恢复。',
       author: 'Bilfav Select contributors; based on madoka-chann',
       license: 'MIT',

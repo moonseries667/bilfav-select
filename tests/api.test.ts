@@ -189,6 +189,37 @@ describe('HttpBilibiliAdapter', () => {
     expect(calls.some(call => call.url.includes('/view?'))).toBe(false);
   });
 
+  it('announces the fourth page and missing-ID checks before awaiting them in a 72/73 scan', async () => {
+    const medias = Array.from({ length: 72 }, (_, index) => ({ id: index + 1, type: 2, attr: 0, title: `v${index + 1}` }));
+    const progress = vi.fn();
+    const latest = () => progress.mock.calls.at(-1)?.[0];
+    const { mock, calls } = transport(url => {
+      if (url.includes('/x/web-interface/nav')) return { body: loggedIn() };
+      if (url.includes('/created/list-all')) return { body: folderList([folder(509, 2, { media_count: 73 })]) };
+      if (url.includes('/resource/list')) {
+        const pn = Number(new URL(url).searchParams.get('pn'));
+        expect(latest()).toMatchObject({ phase: 'scanning', completed: (pn - 1) * 20, total: 73,
+          message: expect.stringContaining(`第 ${pn} 页`) });
+        return { body: ok({ medias: medias.slice((pn - 1) * 20, pn * 20), has_more: pn < 4 }) };
+      }
+      if (url.includes('/resource/ids')) {
+        expect(latest()).toMatchObject({ phase: 'reconciling', completed: 72, total: 73,
+          message: expect.stringContaining('核对完整 ID 列表') });
+        return { body: ok([...medias, { id: 73, type: 2 }]) };
+      }
+      if (url.includes('/view?aid=73')) {
+        expect(latest()).toMatchObject({ phase: 'reconciling', completed: 0, total: 1,
+          message: expect.stringContaining('aid 73') });
+        return { body: { code: 62012, data: null } };
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    expect(await new HttpBilibiliAdapter(settings(), { progress }, mock).listFolderVideos(509)).toHaveLength(72);
+    expect(latest()).toMatchObject({ phase: 'reconciling', completed: 1, total: 1 });
+    expect(calls.filter(call => call.url.includes('/resource/list'))).toHaveLength(4);
+    expect(calls.some(call => call.url.includes('/view/detail/tag') || call.options.method === 'POST')).toBe(false);
+  });
+
   it.each([[], null])('accepts an all-unavailable terminal page %j after confirming missing IDs', async medias => {
     const { mock, calls } = transport(url => {
       if (url.includes('/x/web-interface/nav')) return { body: loggedIn() };

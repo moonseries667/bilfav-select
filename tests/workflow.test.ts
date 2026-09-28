@@ -3,7 +3,7 @@ import { createInitialData } from '../src/lib/storage';
 import { AppError, PauseError } from '../src/lib/errors';
 import { DEFAULT_SETTINGS } from '../src/defaults';
 import { Workflow } from '../src/core/workflow';
-import { UNCERTAIN, type AppData, type BilibiliAdapter, type ClassificationManifest, type Folder, type FolderId, type FolderVideo, type Repository, type Settings, type VideoMetadata } from '../src/types';
+import { UNCERTAIN, type AppData, type BilibiliAdapter, type ClassificationManifest, type Folder, type FolderId, type FolderVideo, type Progress, type Repository, type Settings, type VideoMetadata } from '../src/types';
 
 class MemoryRepository implements Repository {
   value: AppData;
@@ -187,6 +187,27 @@ describe('Workflow source freeze and dataset refresh', () => {
     expect(shared.primarySourceFolderId).toBe(10);
     expect(dataset.videos[0].tags).toEqual(['完整标签A', '完整标签B']);
     expect(dataset.videos[0].upper).toEqual({ mid: 8, name: 'UP' });
+  });
+
+  it('switches from the final folder page to metadata progress before each request, including skipped videos', async () => {
+    const adapter = new FakeAdapter();
+    const updates: Progress[] = [];
+    const workflow = new Workflow(adapter, new MemoryRepository(), { progress: value => updates.push(value) });
+    await workflow.freezeSources();
+    const list = adapter.listFolderVideos.bind(adapter);
+    vi.spyOn(adapter, 'listFolderVideos').mockImplementation(async id => {
+      updates.push({ phase: 'scanning', completed: 72, total: 73, message: '已读取收藏夹第 4 页' });
+      return list(id);
+    });
+    vi.spyOn(adapter, 'getVideoMetadata').mockImplementation(async aid => {
+      expect(updates.at(-1)).toMatchObject({ phase: 'metadata', total: 3, message: expect.stringContaining(`aid ${aid}`) });
+      if (aid === 102) return { aid, title: 'gone', description: '', tags: [], unavailable: true };
+      return { aid, title: `video ${aid}`, description: '', tags: [] };
+    });
+    await workflow.refreshDataset(true);
+    expect(updates.filter(value => value.phase === 'metadata').map(value => value.completed)).toEqual([0, 1, 2]);
+    expect(updates.at(-1)).toMatchObject({ phase: 'dataset', completed: 2, total: 2 });
+    expect(workflow.data.dataset?.videos.map(video => video.aid)).toEqual([101, 103]);
   });
 
   it('skips an unavailable video without blocking other metadata and excludes its aid from the dataset and copies', async () => {

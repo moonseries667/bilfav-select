@@ -110,12 +110,13 @@ export class BilibiliHttpClient {
         });
       } catch (error) {
         if (error instanceof PauseError || (error instanceof AppError && error.kind === 'paused')) throw error;
+        const timedOut = error instanceof AppError && error.code === 408;
         if (retryNetwork && attempt < retries) {
           this.pendingWaitMs = Math.max(this.pendingWaitMs, jitter(backoff(attempt)));
-          this.hooks.log?.('B 站请求暂时失败，等待后重试', 'warning');
+          this.hooks.log?.(`B 站请求${timedOut ? '超时（单次 30 秒）' : '暂时失败'}，等待后重试 ${attempt + 1}/${retries}`, 'warning');
           continue;
         }
-        throw new AppError('B 站网络请求失败，请检查连接后重试', 'network', undefined, retryNetwork);
+        throw new AppError(timedOut ? 'B 站请求超时（单次 30 秒），已停止；请检查连接后重试' : 'B 站网络请求失败，请检查连接后重试', 'network', timedOut ? 408 : undefined, retryNetwork);
       }
 
       if (response.status === 412 || response.status === 429) {
