@@ -138,6 +138,18 @@ function makeApiUrl(path: string, params: Record<string, string | number>): stri
   return `${API}${path}?${query.toString()}`;
 }
 
+function resourceKey(media: FolderResource): string {
+  const raw = asRecord(media);
+  return `${requiredPositiveInteger(raw?.id, '资源 ID')}:${requiredPositiveInteger(raw?.type, '资源类型')}`;
+}
+
+function isUnavailableResource(media: FolderResource): boolean {
+  const attr = asFiniteNumber(media.attr);
+  // Bit 0 marks unavailable resources (including attr 1 and 9). Other
+  // attribute bits, such as interactive videos, do not imply deletion.
+  return attr !== undefined && (Math.trunc(attr) & 1) !== 0;
+}
+
 function isBatchEndpointUnavailable(error: unknown): boolean {
   return error instanceof AppError && (error.code === 404 || error.code === 405 || error.code === 501);
 }
@@ -150,6 +162,7 @@ function isBatchEndpointUnavailable(error: unknown): boolean {
 export class HttpBilibiliAdapter implements BilibiliAdapter {
   private readonly http: BilibiliHttpClient;
   private folderCache?: { fetchedAt: number; ownerMid: number; folders: Folder[] };
+  private readonly unavailableAids = new Set<number>();
 
   constructor(
     settings: Pick<Settings, 'requestDelayMs' | 'cooldownMs' | 'maxRetries'>,
@@ -279,8 +292,9 @@ export class HttpBilibiliAdapter implements BilibiliAdapter {
       let pageMedias: FolderResource[];
       if (Array.isArray(page.medias)) {
         pageMedias = page.medias;
-      } else if (page.medias === null && page.has_more === false && expectedCount === 0) {
-        // Bilibili returns null rather than [] for a genuinely empty folder.
+      } else if (page.medias === null) {
+        // A page can be empty when its entries are all hidden/unavailable.
+        // A nonzero count is reconciled against the complete ID list below.
         pageMedias = [];
       } else {
         throw new AppError(`收藏夹第 ${pageNumber} 页内容缺失，拒绝返回部分结果`, 'invalid', undefined, true);
@@ -291,8 +305,8 @@ export class HttpBilibiliAdapter implements BilibiliAdapter {
         throw new AppError('B 站分页重复返回同一页，拒绝返回不完整内容', 'invalid', undefined, true);
       }
       if (signature) pageSignatures.add(signature);
-      if (page.has_more && pageMedias.length === 0) {
-        throw new AppError('B 站分页仍标记有后续内容却返回空页，拒绝返回部分内容', 'invalid', undefined, true);
+      if (page.has_more && pageMedias.length === 0 && pageNumber >= Math.max(1, Math.ceil(expectedCount / PAGE_SIZE))) {
+        throw new AppError('B 站分页超出收藏夹总数仍返回空页，拒绝返回部分内容', 'invalid', undefined, true);
       }
       allRaw.push(...pageMedias);
       hasMore = page.has_more;
@@ -307,8 +321,8 @@ export class HttpBilibiliAdapter implements BilibiliAdapter {
       pageNumber++;
     }
 
-    if (expectedCount !== undefined && allRaw.length !== expectedCount) {
-      throw new AppError(`收藏夹只返回 ${allRaw.length}/${expectedCount} 项，拒绝报告扫描成功`, 'invalid', undefined, true);
+    if (allRaw.length !== expectedCount) {
+      await this.reconcileFolderResources(id, allRaw, expectedCount);
     }
 
     const videos: FolderVideo[] = [];
@@ -317,17 +331,22 @@ export class HttpBilibiliAdapter implements BilibiliAdapter {
       const type = asFiniteNumber(media.type);
       if (!Number.isSafeInteger(type) || Number(type) <= 0) throw new AppError('收藏内容缺少有效资源类型，拒绝静默丢弃视频', 'invalid');
       if (type !== 2) continue;
+      if (isUnavailableResource(media)) {
+        const aid = asFiniteNumber(media.id);
+        if (aid !== undefined) this.unavailableAids.add(aid);
+        continue;
+      }
       const aid = requiredPositiveInteger(media.id, '视频 aid');
+      if (this.unavailableAids.has(aid)) continue;
       if (seenAids.has(aid)) continue;
       seenAids.add(aid);
       const upper = asRecord(media.upper);
       const upperMid = asFiniteNumber(upper?.mid);
-      const unavailable = asFiniteNumber(media.attr) !== undefined && asFiniteNumber(media.attr) !== 0;
       videos.push({
         aid,
         ...((typeof media.bvid === 'string' && media.bvid) || (typeof media.bv_id === 'string' && media.bv_id)
           ? { bvid: String(media.bvid || media.bv_id) } : {}),
-        title: asString(media.title, unavailable ? '已失效视频' : ''),
+        title: asString(media.title),
         description: asString(media.intro),
         ...(upperMid === undefined && typeof upper?.name !== 'string' ? {} : {
           upper: {
@@ -336,7 +355,6 @@ export class HttpBilibiliAdapter implements BilibiliAdapter {
           },
         }),
         ...(asFiniteNumber(media.duration) === undefined ? {} : { duration: asFiniteNumber(media.duration) }),
-        ...(unavailable ? { unavailable: true } : {}),
       });
     }
     return videos;
@@ -344,19 +362,29 @@ export class HttpBilibiliAdapter implements BilibiliAdapter {
 
   async getVideoMetadata(aid: number, bvid?: string): Promise<VideoMetadata> {
     const validAid = requiredPositiveInteger(aid, '视频 aid');
+    const unavailable = (): VideoMetadata => ({
+      aid: validAid, ...(bvid ? { bvid } : {}), title: '已失效视频', description: '', tags: [], unavailable: true,
+    });
+    if (this.unavailableAids.has(validAid)) return unavailable();
     const viewUrl = makeApiUrl('/x/web-interface/view', bvid ? { bvid } : { aid: validAid });
     let view: ViewResponse;
     try {
       view = await this.http.getData<ViewResponse>(viewUrl);
     } catch (error) {
       if (error instanceof AppError && error.kind === 'unavailable') {
-        return { aid: validAid, ...(bvid ? { bvid } : {}), title: '已失效视频', description: '', tags: [], unavailable: true };
+        this.unavailableAids.add(validAid);
+        return unavailable();
       }
       throw error;
     }
     const actualAid = asFiniteNumber(view?.aid);
     if (actualAid !== validAid || typeof view?.title !== 'string') {
       throw new AppError('B 站视频详情与请求的 aid 不一致或缺少标题', 'invalid');
+    }
+    const state = asFiniteNumber(view.state);
+    if (state !== undefined && state < 0) {
+      this.unavailableAids.add(validAid);
+      return unavailable();
     }
     const tagData = await this.http.getData<unknown>(makeApiUrl('/x/web-interface/view/detail/tag', { aid: validAid }));
     if (tagData !== null && !Array.isArray(tagData)) throw new AppError('B 站视频标签响应格式无效，拒绝保存不完整标签', 'invalid');
@@ -370,7 +398,6 @@ export class HttpBilibiliAdapter implements BilibiliAdapter {
     const duration = asFiniteNumber(view.duration);
     const tid = asFiniteNumber(view.tid);
     const tidV2 = asFiniteNumber(view.tid_v2);
-    const state = asFiniteNumber(view.state);
     return {
       aid: validAid,
       ...((typeof view.bvid === 'string' && view.bvid) || bvid ? { bvid: String(view.bvid || bvid) } : {}),
@@ -387,19 +414,19 @@ export class HttpBilibiliAdapter implements BilibiliAdapter {
         },
       }),
       ...(duration === undefined ? {} : { duration }),
-      ...(state !== undefined && state < 0 ? { unavailable: true } : {}),
     };
   }
 
   async copyVideos(sourceId: FolderId, targetId: FolderId, aids: number[]): Promise<void> {
     if (!aids.length) return;
+    const validAids = [...new Set(aids.map(aid => requiredPositiveInteger(aid, '视频 aid')))]
+      .filter(aid => !this.unavailableAids.has(aid));
+    if (!validAids.length) return;
     if (sourceId === targetId) throw new AppError('源收藏夹与目标收藏夹不能相同', 'safety');
     const user = await this.getCurrentUser();
     const source = await this.assertOwnedFolder(sourceId, user.mid, false);
     const target = await this.assertOwnedFolder(targetId, user.mid, false);
     if (source.isDefault || target.isDefault) throw new AppError('复制操作不能读取或写入系统默认收藏夹', 'safety');
-    const validAids = [...new Set(aids.map(aid => requiredPositiveInteger(aid, '视频 aid')))];
-    if (!validAids.length) return;
     const csrf = readBilibiliCsrf();
 
     try {
@@ -431,6 +458,37 @@ export class HttpBilibiliAdapter implements BilibiliAdapter {
   async getFolderAidSet(id: FolderId): Promise<Set<number>> {
     const videos = await this.listFolderVideos(id);
     return new Set(videos.map(video => video.aid));
+  }
+
+  isVideoUnavailable(aid: number): boolean {
+    return this.unavailableAids.has(aid);
+  }
+
+  private async reconcileFolderResources(id: FolderId, resources: FolderResource[], expectedCount: number): Promise<void> {
+    // media_count may include hidden unavailable entries. Do not use a count
+    // mismatch alone to guess which videos are unavailable or accept lost pages.
+    const ids = await this.http.getData<FolderResource[]>(makeApiUrl('/x/v3/fav/resource/ids', {
+      media_id: id, platform: 'web',
+    }));
+    if (!Array.isArray(ids)) throw new AppError('收藏夹完整 ID 列表缺失，拒绝返回部分内容', 'invalid', undefined, true);
+    const byKey = new Map(ids.map(media => [resourceKey(media), media]));
+    const returnedKeys = new Set(resources.map(resourceKey));
+    if (byKey.size !== ids.length || returnedKeys.size !== resources.length ||
+        [...returnedKeys].some(key => !byKey.has(key))) {
+      throw new AppError('收藏夹分页与完整 ID 列表不一致，请重试扫描', 'invalid', undefined, true);
+    }
+    for (const [key, media] of byKey) {
+      if (returnedKeys.has(key) || asFiniteNumber(media.type) !== 2) continue;
+      const aid = requiredPositiveInteger(media.id, '视频 aid');
+      if (this.unavailableAids.has(aid)) continue;
+      const bvid = asString(media.bvid, asString(media.bv_id));
+      const metadata = await this.getVideoMetadata(aid, bvid || undefined);
+      if (!metadata.unavailable) {
+        // An available ID missing from pagination is a genuinely partial scan.
+        throw new AppError(`收藏夹漏读了有效视频 ${aid}，请重试扫描`, 'invalid', undefined, true);
+      }
+    }
+    this.hooks.log?.(`收藏夹 ${id} 返回 ${resources.length}/${expectedCount} 项，已核对完整 ID 列表；失效视频跳过，可用视频继续处理`, 'info');
   }
 
   private async assertOwnedFolder(id: FolderId, ownerMid: number, refresh: boolean): Promise<Folder> {

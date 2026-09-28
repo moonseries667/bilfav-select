@@ -84,6 +84,7 @@ export class Workflow {
     if (!force && oldDataset && this.now().getTime() - Date.parse(oldDataset.updatedAt) < ttl) return oldDataset;
 
     const sourceVideos = new Map<number, { video: { aid: number; bvid?: string; title: string; description?: string; upper?: { mid?: number; name?: string }; duration?: number; unavailable?: boolean }; sourceFolderIds: number[]; primarySourceFolderId: number }>();
+    const unavailableAids = new Set<number>();
     // Build locally and only replace the saved dataset after every source page
     // and every retryable metadata request has completed successfully.
     for (const sourceId of this.data.state.sourceFolderIds) {
@@ -91,6 +92,10 @@ export class Workflow {
       const folderVideos = await this.adapter.listFolderVideos(sourceId);
       const seenInFolder = new Set<number>();
       for (const video of folderVideos) {
+        if (video.unavailable) {
+          unavailableAids.add(video.aid);
+          continue;
+        }
         if (!Number.isSafeInteger(video.aid) || video.aid <= 0 || seenInFolder.has(video.aid)) continue;
         seenInFolder.add(video.aid);
         const prior = sourceVideos.get(video.aid);
@@ -106,6 +111,10 @@ export class Workflow {
     const videos: VideoRecord[] = [];
     for (const [aid, row] of sourceVideos) {
       this.checkpoint();
+      if (unavailableAids.has(aid) || this.adapter.isVideoUnavailable?.(aid)) {
+        unavailableAids.add(aid);
+        continue;
+      }
       const cached = oldDataset?.videos.find(video => video.aid === aid);
       let metadata: VideoMetadata;
       const cachedAt = cached ? Date.parse(cached.metadataFetchedAt) : Number.NaN;
@@ -124,12 +133,11 @@ export class Workflow {
         metadata = await this.adapter.getVideoMetadata(aid, row.video.bvid);
       } catch (error) {
         if (!isUnavailable(error)) throw error;
-        videos.push({
-          aid, bvid: row.video.bvid, title: row.video.title, description: row.video.description ?? '', tags: [],
-          upper: row.video.upper ? { ...row.video.upper } : undefined, duration: row.video.duration,
-          unavailable: true, sourceFolderIds: [...row.sourceFolderIds],
-          primarySourceFolderId: row.primarySourceFolderId, metadataFetchedAt: fetchedAt,
-        });
+        unavailableAids.add(aid);
+        continue;
+      }
+      if (metadata.unavailable) {
+        unavailableAids.add(aid);
         continue;
       }
 
@@ -144,7 +152,6 @@ export class Workflow {
         tidV2: metadata.tidV2,
         upper: metadata.upper ? { ...metadata.upper } : row.video.upper ? { ...row.video.upper } : undefined,
         duration: metadata.duration ?? row.video.duration,
-        unavailable: Boolean(metadata.unavailable),
         sourceFolderIds: [...row.sourceFolderIds],
         primarySourceFolderId: row.primarySourceFolderId,
         metadataFetchedAt: fetchedAt,
@@ -160,6 +167,7 @@ export class Workflow {
     };
     this.data.dataset = dataset;
     this.persist();
+    if (unavailableAids.size) this.hooks.log?.(`已跳过 ${unavailableAids.size} 个失效视频，不参与分类或复制`, 'info');
     this.progress('dataset', videos.length, videos.length, `已更新 ${videos.length} 个唯一视频`);
     return dataset;
   }
@@ -304,6 +312,7 @@ export class Workflow {
       if (Object.prototype.hasOwnProperty.call(execution.sourceBefore, key)) continue;
       const aids = await this.adapter.getFolderAidSet(sourceId);
       execution.sourceBefore[key] = sorted(aids);
+      this.syncUnavailableVideos();
       this.persist();
     }
   }
@@ -382,6 +391,13 @@ export class Workflow {
   private async copyRemaining(settings: Settings, manifest: ClassificationManifest): Promise<void> {
     const dataset = this.requireDataset();
     const execution = this.data.state.execution;
+    // Recheck sources before a copy or resumed copy: cached metadata cannot
+    // make a video eligible once the list has confirmed it is unavailable.
+    for (const sourceId of this.data.state.sourceFolderIds) {
+      this.checkpoint();
+      await this.adapter.getFolderAidSet(sourceId);
+    }
+    this.syncUnavailableVideos();
     const byAid = new Map(dataset.videos.map(video => [video.aid, video]));
     const copyItems = manifest.results.flatMap(result => {
       const video = byAid.get(result.aid);
@@ -457,9 +473,16 @@ export class Workflow {
     const dataset = this.requireDataset();
     const execution = this.data.state.execution;
     const targetSets = await this.readTargetSets(execution.targetFolderIds);
+    const sourceSets = new Map<FolderId, Set<number>>();
+    for (const sourceId of this.data.state.sourceFolderIds) {
+      this.checkpoint();
+      sourceSets.set(sourceId, await this.adapter.getFolderAidSet(sourceId));
+    }
+    this.syncUnavailableVideos();
     const availableByAid = new Map(dataset.videos.filter(video => !video.unavailable).map(video => [video.aid, video]));
+    const unavailableAids = new Set(dataset.videos.filter(video => video.unavailable).map(video => video.aid));
     const resultByAid = new Map(manifest.results.map(result => [result.aid, result]));
-    const categories = this.categoriesInManifest();
+    const categories = [...new Set([...this.categoriesInManifest(), ...Object.keys(execution.targetFolderIds)])];
     const perCategory: VerificationReport['perCategory'] = {};
     const wrongCategory: VerificationReport['wrongCategory'] = [];
     const correctlyPlaced = new Set<number>();
@@ -467,7 +490,7 @@ export class Workflow {
 
     for (const category of categories) {
       const expected = new Set(manifest.results.filter(result => result.category === category && availableByAid.has(result.aid)).map(result => result.aid));
-      const actual = targetSets.get(category) ?? new Set<number>();
+      const actual = new Set([...(targetSets.get(category) ?? [])].filter(aid => !unavailableAids.has(aid)));
       const missing = sorted([...expected].filter(aid => !actual.has(aid)));
       const unexpected = sorted([...actual].filter(aid => !expected.has(aid)));
       if (unexpected.length) hasUnexpected = true;
@@ -487,9 +510,9 @@ export class Workflow {
       if (!Object.prototype.hasOwnProperty.call(execution.sourceBefore, String(sourceId))) {
         throw safety(`冻结源 ID ${sourceId} 缺少 Apply 前的 aid 快照，不能报告 Verify 通过`);
       }
-      const actual = await this.adapter.getFolderAidSet(sourceId);
+      const actual = sourceSets.get(sourceId)!;
       const expected = execution.sourceBefore[String(sourceId)] ?? [];
-      const missing = sorted(expected.filter(aid => !actual.has(aid)));
+      const missing = sorted(expected.filter(aid => !unavailableAids.has(aid) && !actual.has(aid)));
       if (missing.length) sourceMissing[String(sourceId)] = missing;
     }
 
@@ -497,9 +520,9 @@ export class Workflow {
     const missingAids = new Set(Object.values(perCategory).flatMap(category => category.missing));
     const report: VerificationReport = {
       verifiedAt: this.now().toISOString(),
-      total: dataset.videos.length,
+      total: availableByAid.size,
       copied: correctlyPlaced.size,
-      uncertain: manifest.results.filter(result => result.category === UNCERTAIN).length,
+      uncertain: manifest.results.filter(result => result.category === UNCERTAIN && availableByAid.has(result.aid)).length,
       unavailable,
       failed: missingAids.size,
       perCategory,
@@ -577,7 +600,14 @@ export class Workflow {
 
   private categoriesInManifest(): string[] {
     const manifest = this.requireManifest();
-    return [...new Set(manifest.results.map(result => result.category))];
+    const availableAids = new Set(this.requireDataset().videos.filter(video => !video.unavailable).map(video => video.aid));
+    return [...new Set(manifest.results.filter(result => availableAids.has(result.aid)).map(result => result.category))];
+  }
+
+  private syncUnavailableVideos(): void {
+    for (const video of this.requireDataset().videos) {
+      if (this.adapter.isVideoUnavailable?.(video.aid)) video.unavailable = true;
+    }
   }
 
   private requireDataset(): VideoDataset {

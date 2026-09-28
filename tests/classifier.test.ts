@@ -156,11 +156,11 @@ describe('parseClassification', () => {
       .toMatchObject({ category: '不确定', confidence: 0 });
   });
 
-  it('keeps unavailable videos uncertain even if a model result is supplied', () => {
+  it('omits unavailable videos even if a model result is supplied', () => {
     const parsed = parseClassification(JSON.stringify([
       { aid: 1, category: '电影', confidence: 1 },
     ]), [video(1, { unavailable: true })], categories, 0.7);
-    expect(parsed[0]).toMatchObject({ category: '不确定', reason: '视频不可用' });
+    expect(parsed).toEqual([]);
   });
 });
 
@@ -205,15 +205,26 @@ describe('classifyDataset', () => {
     expect(manifest.stats).toEqual({ 电影: 1, 知识: 0, 不确定: 0 });
   });
 
-  it('does not call the provider for unavailable videos and records them as uncertain', async () => {
+  it('does not call the provider or create results for unavailable videos', async () => {
     const complete = vi.fn(async () => '[]');
     const manifest = await classifyDataset(
       dataset([video(18, { unavailable: true })]), settings(), {}, { complete },
     );
 
     expect(complete).not.toHaveBeenCalled();
-    expect(manifest.results[0]).toMatchObject({ aid: 18, category: '不确定', reason: '视频不可用' });
-    expect(manifest.stats).toEqual({ 电影: 0, 知识: 0, 不确定: 1 });
+    expect(manifest.results).toEqual([]);
+    expect(manifest.stats).toEqual({ 电影: 0, 知识: 0, 不确定: 0 });
+  });
+
+  it('excludes unavailable metadata from mixed AI batches and ignores its returned result', async () => {
+    const complete = vi.fn(async (_system: string, user: string) => {
+      const sent = JSON.parse(user.slice(user.indexOf('videos = ') + 'videos = '.length));
+      expect(sent.map((item: { aid: number }) => item.aid)).toEqual([17]);
+      return '[{"aid":17,"category":"电影","confidence":0.9},{"aid":18,"category":"电影","confidence":1}]';
+    });
+    const manifest = await classifyDataset(dataset([video(17), video(18, { unavailable: true })]), settings(), {}, { complete });
+    expect(manifest.results.map(result => result.aid)).toEqual([17]);
+    expect(manifest.stats).toEqual({ 电影: 1, 知识: 0, 不确定: 0 });
   });
 
   it('bounds batch retries and makes every item in the exhausted batch uncertain', async () => {

@@ -19,8 +19,11 @@ class VerifyAdapter implements BilibiliAdapter {
   sourceVideos: FolderVideo[] = [101, 102, 103].map(aid => ({ aid, title: `视频${aid}` }));
   aids = new Map<number, Set<number>>([[1, new Set()], [10, new Set([101, 102, 103])]]);
   nextId = 20;
+  unavailableAids = new Set<number>();
   copies: Array<{ source: number; target: number; aids: number[] }> = [];
   dropOnce = new Set<number>();
+
+  isVideoUnavailable(aid: number): boolean { return this.unavailableAids.has(aid); }
 
   async getCurrentUser(): Promise<{ mid: number; name: string }> { return { mid: 88, name: 'verify' }; }
   async listFolders(): Promise<Folder[]> { return this.folders.map(folder => ({ ...folder })); }
@@ -136,5 +139,21 @@ describe('Workflow verification', () => {
     expect(report.uncertain).toBe(1);
     expect(adapter.aids.get(1)).toEqual(new Set());
     expect(adapter.copies.every(copy => copy.source !== 1 && copy.target !== 1)).toBe(true);
+  });
+
+  it('ignores newly unavailable videos but still checks an existing category for unexpected available content', async () => {
+    const { adapter, workflow, manifest, settings: config } = await setup();
+    await workflow.applyManifest(manifest, config);
+    const uncertainId = workflow.data.state.generatedFolderIds[UNCERTAIN];
+    adapter.unavailableAids.add(103);
+    adapter.aids.get(10)!.delete(103);
+    const passed = await workflow.verify(config);
+    expect(passed.passed).toBe(true);
+    expect(passed.total).toBe(2);
+    expect(passed.uncertain).toBe(0);
+    adapter.aids.get(uncertainId)!.add(999);
+    const report = await workflow.verify(config);
+    expect(report.passed).toBe(false);
+    expect(report.perCategory[UNCERTAIN].unexpected).toEqual([999]);
   });
 });

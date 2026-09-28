@@ -48,7 +48,10 @@ export function validateManifest(input: unknown, dataset?: VideoDataset): Classi
   });
   if (dataset) {
     if (obj.datasetVersion !== dataset.version || obj.datasetUpdatedAt !== dataset.updatedAt) fail('与当前数据集版本不一致，请重新分类');
-    if (results.length !== dataset.videos.length || dataset.videos.some(video => !seen.has(video.aid))) fail('必须完整覆盖当前数据集且每个 aid 恰好一次');
+    const datasetAids = new Set(dataset.videos.map(video => video.aid));
+    // Legacy manifests may contain unavailable records. Keep their normalized
+    // contents for resume hashes, but only require coverage of available videos.
+    if (results.some(result => !datasetAids.has(result.aid)) || dataset.videos.some(video => !video.unavailable && !seen.has(video.aid))) fail('必须完整覆盖当前可用数据集且每个 aid 恰好一次');
   }
   return {
     version: 1, runId: obj.runId as string, createdAt: obj.createdAt as string,

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createInitialData } from '../src/lib/storage';
 import { AppError, PauseError } from '../src/lib/errors';
 import { DEFAULT_SETTINGS } from '../src/defaults';
@@ -35,6 +35,9 @@ class FakeAdapter implements BilibiliAdapter {
   pauseNextCopy = false;
   dropOnce = new Set<number>();
   missingFromSourceAfterCopy?: number;
+  unavailableAids = new Set<number>();
+
+  isVideoUnavailable(aid: number): boolean { return this.unavailableAids.has(aid); }
 
   async getCurrentUser(): Promise<{ mid: number; name: string }> { return { mid: this.userMid, name: 'tester' }; }
   async listFolders(): Promise<Folder[]> { return this.folders.map(folder => ({ ...folder })); }
@@ -186,15 +189,31 @@ describe('Workflow source freeze and dataset refresh', () => {
     expect(dataset.videos[0].upper).toEqual({ mid: 8, name: 'UP' });
   });
 
-  it('keeps an unavailable video without blocking other metadata and excludes its aid from copies', async () => {
+  it('skips an unavailable video without blocking other metadata and excludes its aid from the dataset and copies', async () => {
     const adapter = new FakeAdapter();
     adapter.metadataFailure = { aid: 102, error: new AppError('视频不可用', 'unavailable') };
     const { workflow, dataset } = await frozenDataset(adapter);
-    expect(dataset.videos.find(video => video.aid === 102)?.unavailable).toBe(true);
+    expect(dataset.videos.map(video => video.aid)).toEqual([101, 103]);
     const manifest = makeManifest(dataset, ['电影']);
     const report = await workflow.applyManifest(manifest, settings());
-    expect(report.unavailable).toBe(1);
+    expect(report.passed).toBe(true);
+    expect(report.total).toBe(2);
     expect(adapter.copies.flatMap(copy => copy.aids)).not.toContain(102);
+  });
+
+  it('never requests metadata for a list-marked unavailable aid even when another source lists it as available', async () => {
+    const adapter = new FakeAdapter();
+    adapter.videos.get(11)![0].unavailable = true;
+    const getMetadata = vi.spyOn(adapter, 'getVideoMetadata');
+    const { dataset } = await frozenDataset(adapter);
+    expect(dataset.videos.map(video => video.aid)).toEqual([101, 103]);
+    expect(getMetadata.mock.calls.map(call => call[0])).toEqual([101, 103]);
+  });
+
+  it('omits metadata marked unavailable from the dataset', async () => {
+    const adapter = new FakeAdapter();
+    adapter.metadata.set(102, { aid: 102, title: 'gone', description: '', tags: [], unavailable: true });
+    expect((await frozenDataset(adapter)).dataset.videos.map(video => video.aid)).toEqual([101, 103]);
   });
 
   it('uses fresh metadata cache when allowed and force refreshes details', async () => {
@@ -210,6 +229,22 @@ describe('Workflow source freeze and dataset refresh', () => {
     expect(calls).toBe(0);
     await workflow.refreshDataset(true);
     expect(calls).toBe(firstCalls);
+  });
+
+  it('does not reuse fresh metadata once the adapter has confirmed the aid unavailable', async () => {
+    const adapter = new FakeAdapter();
+    let now = new Date('2026-09-28T00:00:00.000Z');
+    const workflow = new Workflow(adapter, new MemoryRepository(), { now: () => now });
+    await workflow.freezeSources();
+    await workflow.refreshDataset(true);
+    // Force a new list scan while the individual metadata is still within TTL.
+    workflow.data.dataset!.updatedAt = '2026-09-26T00:00:00.000Z';
+    now = new Date('2026-09-28T01:00:00.000Z');
+    adapter.unavailableAids.add(102);
+    const getMetadata = vi.spyOn(adapter, 'getVideoMetadata');
+    const refreshed = await workflow.refreshDataset(false, 86400000);
+    expect(refreshed.videos.map(video => video.aid)).toEqual([101, 103]);
+    expect(getMetadata).not.toHaveBeenCalled();
   });
 
   it('preserves the last good dataset when a transient metadata request fails', async () => {
@@ -231,6 +266,38 @@ describe('Workflow source freeze and dataset refresh', () => {
 });
 
 describe('Workflow generated-folder safety, apply, and resume', () => {
+  it('skips legacy unavailable results and creates no category solely for them, including after resume', async () => {
+    const { adapter, repo, workflow, dataset } = await frozenDataset();
+    dataset.videos.find(video => video.aid === 102)!.unavailable = true;
+    adapter.folderAids.get(10)!.delete(102);
+    adapter.folderAids.get(11)!.delete(102);
+    const manifest = makeManifest(dataset, ['电影', UNCERTAIN, '电影']);
+    adapter.pauseNextCopy = true;
+    await expect(workflow.applyManifest(manifest, settings())).rejects.toBeInstanceOf(PauseError);
+    // Old versions may have captured unavailable aids in their source snapshot.
+    repo.value.state.execution.sourceBefore['10'].push(102);
+    const resumed = new Workflow(adapter, repo, { sleep: async () => undefined });
+    const report = await resumed.resume(settings());
+    expect(report.passed).toBe(true);
+    expect(report.total).toBe(2);
+    expect(report.uncertain).toBe(0);
+    expect(Object.keys(resumed.data.state.generatedFolderIds)).toEqual(['电影']);
+    expect(adapter.copies.flatMap(copy => copy.aids)).toEqual([101, 103]);
+    expect(resumed.data.manifest?.results.map(result => result.aid)).toEqual([101, 102, 103]);
+  });
+
+  it('excludes a video confirmed unavailable after refresh from cached-manifest apply', async () => {
+    const { adapter, workflow, dataset } = await frozenDataset();
+    adapter.unavailableAids.add(102);
+    adapter.folderAids.get(10)!.delete(102);
+    adapter.folderAids.get(11)!.delete(102);
+    const report = await workflow.applyManifest(makeManifest(dataset, ['电影', UNCERTAIN, '电影']), settings());
+    expect(report.passed).toBe(true);
+    expect(report.total).toBe(2);
+    expect(Object.keys(workflow.data.state.generatedFolderIds)).toEqual(['电影']);
+    expect(adapter.copies.flatMap(copy => copy.aids)).toEqual([101, 103]);
+  });
+
   it('prevalidates every cleanup ID so source and default folders cannot be deleted', async () => {
     const { adapter, workflow } = await frozenDataset();
     workflow.data.state.generatedFolderIds = { badSource: 10, badDefault: 1 };

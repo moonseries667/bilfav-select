@@ -133,7 +133,7 @@ describe('HttpBilibiliAdapter', () => {
     expect(calls.some(call => call.url.includes('/x/web-interface/view/detail/tag?aid=123'))).toBe(true);
   });
 
-  it('rejects missing resource types and truncated scans even if page info is absent', async () => {
+  it('rejects missing resource types and an unconfirmed ID list even if page info is absent', async () => {
     let medias: unknown[] = [{ id: 1, title: 'schema changed' }];
     const { mock } = transport(url => {
       if (url.includes('/x/web-interface/nav')) return { body: loggedIn() };
@@ -143,7 +143,136 @@ describe('HttpBilibiliAdapter', () => {
     const adapter = new HttpBilibiliAdapter(settings(), {}, mock);
     await expect(adapter.listFolderVideos(201)).rejects.toMatchObject({ kind: 'invalid' });
     medias = [];
-    await expect(adapter.listFolderVideos(201)).rejects.toThrow('0/1');
+    await expect(adapter.listFolderVideos(201)).rejects.toThrow('完整 ID 列表缺失');
+  });
+
+  it('scans 98/99 items when the omitted ID is confirmed unavailable and never operates on that video', async () => {
+    const medias = Array.from({ length: 98 }, (_, index) => ({ id: index + 1, type: 2, attr: 0, title: `v${index + 1}` }));
+    const { mock, calls } = transport(url => {
+      if (url.includes('/x/web-interface/nav')) return { body: loggedIn() };
+      if (url.includes('/created/list-all')) return { body: folderList([folder(500, 2, { media_count: 99 })]) };
+      if (url.includes('/resource/ids')) return { body: ok([...medias, { id: 99, type: 2 }]) };
+      if (url.includes('/resource/list')) {
+        const pn = Number(new URL(url).searchParams.get('pn'));
+        return { body: ok({ info: { media_count: 99 }, medias: medias.slice((pn - 1) * 20, pn * 20), has_more: pn < 5 }) };
+      }
+      if (url.includes('/view?aid=99')) return { body: { code: -404, data: null } };
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    const adapter = new HttpBilibiliAdapter(settings(), {}, mock);
+
+    expect((await adapter.listFolderVideos(500)).map(video => video.aid)).toEqual(medias.map(media => media.id));
+    // Repeated source/target verification should reuse the confirmed status.
+    expect(await adapter.getFolderAidSet(500)).toEqual(new Set(medias.map(media => media.id)));
+    const countBefore = calls.length;
+    await adapter.copyVideos(500, 501, [99]);
+    expect(calls).toHaveLength(countBefore);
+    expect(calls.filter(call => call.url.includes('/view?aid=99'))).toHaveLength(1);
+    expect(calls.some(call => call.url.includes('/view/detail/tag') || call.options.method === 'POST')).toBe(false);
+  });
+
+  it('cross-checks an ID list that excludes hidden entries instead of requiring media_count equality', async () => {
+    const media = { id: 1, type: 2, attr: 0, title: 'valid' };
+    const { mock, calls } = transport(url => {
+      if (url.includes('/x/web-interface/nav')) return { body: loggedIn() };
+      if (url.includes('/created/list-all')) return { body: folderList([folder(501, 2, { media_count: 2 })]) };
+      if (url.includes('/resource/ids')) return { body: ok([{ id: 1, type: 2 }]) };
+      if (url.includes('/resource/list')) return { body: ok({ medias: [media], has_more: false }) };
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    expect(await new HttpBilibiliAdapter(settings(), {}, mock).listFolderVideos(501)).toMatchObject([{ aid: 1 }]);
+    expect(calls.some(call => call.url.includes('/view?'))).toBe(false);
+  });
+
+  it.each([[], null])('accepts an all-unavailable terminal page %j after confirming missing IDs', async medias => {
+    const { mock, calls } = transport(url => {
+      if (url.includes('/x/web-interface/nav')) return { body: loggedIn() };
+      if (url.includes('/created/list-all')) return { body: folderList([folder(502, 2, { media_count: 1 })]) };
+      if (url.includes('/resource/ids')) return { body: ok([{ id: 99, type: 2 }]) };
+      if (url.includes('/resource/list')) return { body: ok({ medias, has_more: false }) };
+      if (url.includes('/view?aid=99')) return { body: { code: 11010, data: null } };
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    expect(await new HttpBilibiliAdapter(settings(), {}, mock).listFolderVideos(502)).toEqual([]);
+    expect(calls.some(call => call.url.includes('/view/detail/tag'))).toBe(false);
+  });
+
+  it('skips resource attr 1 and 9 while retaining a valid video with attr 16', async () => {
+    const { mock, calls } = transport(url => {
+      if (url.includes('/x/web-interface/nav')) return { body: loggedIn() };
+      if (url.includes('/created/list-all')) return { body: folderList([folder(503, 2, { media_count: 3 })]) };
+      if (url.includes('/resource/list')) return { body: ok({ medias: [
+        { id: 1, type: 2, attr: 1 }, { id: 2, type: 2, attr: 9 }, { id: 3, type: 2, attr: 16, title: 'interactive' },
+      ], has_more: false }) };
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    const adapter = new HttpBilibiliAdapter(settings(), {}, mock);
+    expect(await adapter.listFolderVideos(503)).toMatchObject([{ aid: 3, title: 'interactive' }]);
+    const countBefore = calls.length;
+    await adapter.getVideoMetadata(1);
+    await adapter.copyVideos(503, 504, [1, 2]);
+    expect(calls).toHaveLength(countBefore);
+  });
+
+  it('continues through an empty middle page containing hidden unavailable videos', async () => {
+    const media = { id: 21, type: 2, attr: 0, title: 'valid after hidden page' };
+    const { mock, calls } = transport(url => {
+      if (url.includes('/x/web-interface/nav')) return { body: loggedIn() };
+      if (url.includes('/created/list-all')) return { body: folderList([folder(506, 2, { media_count: 21 })]) };
+      if (url.includes('/resource/ids')) return { body: ok([{ id: 21, type: 2 }]) };
+      if (url.includes('/resource/list')) return { body: ok(url.includes('pn=1')
+        ? { medias: null, has_more: true }
+        : { medias: [media], has_more: false }) };
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    expect(await new HttpBilibiliAdapter(settings(), {}, mock).listFolderVideos(506)).toMatchObject([{ aid: 21 }]);
+    expect(calls.filter(call => call.url.includes('/resource/list'))).toHaveLength(2);
+  });
+
+  it('rejects an endlessly empty pagination response at the folder-count bound', async () => {
+    const { mock, calls } = transport(url => {
+      if (url.includes('/x/web-interface/nav')) return { body: loggedIn() };
+      if (url.includes('/created/list-all')) return { body: folderList([folder(507, 2, { media_count: 21 })]) };
+      if (url.includes('/resource/list')) return { body: ok({ medias: [], has_more: true }) };
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    await expect(new HttpBilibiliAdapter(settings(), {}, mock).listFolderVideos(507)).rejects.toThrow('仍返回空页');
+    expect(calls.filter(call => call.url.includes('/resource/list'))).toHaveLength(2);
+  });
+
+  it('still rejects an available ID missing from pagination', async () => {
+    const { mock } = transport(url => {
+      if (url.includes('/x/web-interface/nav')) return { body: loggedIn() };
+      if (url.includes('/created/list-all')) return { body: folderList([folder(504, 2, { media_count: 1 })]) };
+      if (url.includes('/resource/ids')) return { body: ok([{ id: 99, type: 2 }]) };
+      if (url.includes('/resource/list')) return { body: ok({ medias: [], has_more: false }) };
+      if (url.includes('/view?aid=99')) return { body: ok({ aid: 99, title: 'available' }) };
+      if (url.includes('/view/detail/tag')) return { body: ok([]) };
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    await expect(new HttpBilibiliAdapter(settings(), {}, mock).listFolderVideos(504)).rejects.toThrow('漏读了有效视频 99');
+  });
+
+  it('propagates a failed missing-ID status request instead of skipping it', async () => {
+    const { mock } = transport(url => {
+      if (url.includes('/x/web-interface/nav')) return { body: loggedIn() };
+      if (url.includes('/created/list-all')) return { body: folderList([folder(505, 2, { media_count: 1 })]) };
+      if (url.includes('/resource/ids')) return { body: ok([{ id: 99, type: 2 }]) };
+      if (url.includes('/resource/list')) return { body: ok({ medias: [], has_more: false }) };
+      if (url.includes('/view?aid=99')) return { reject: true };
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    await expect(new HttpBilibiliAdapter({ ...settings(), maxRetries: 0 }, {}, mock).listFolderVideos(505)).rejects.toMatchObject({ kind: 'network' });
+  });
+
+  it('stops before requesting tags once a negative detail state confirms unavailability', async () => {
+    const { mock, calls } = transport(url => {
+      if (url.includes('/view?aid=99')) return { body: ok({ aid: 99, title: 'removed', state: -2 }) };
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    const adapter = new HttpBilibiliAdapter(settings(), {}, mock);
+    await expect(adapter.getVideoMetadata(99)).resolves.toMatchObject({ aid: 99, unavailable: true });
+    expect(calls).toHaveLength(1);
   });
 
   it('rejects missing detail identity and partially malformed tag records', async () => {

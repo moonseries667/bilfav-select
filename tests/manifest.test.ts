@@ -34,6 +34,19 @@ describe('Manifest boundary and recovery fingerprint', () => {
     manifest.results[0].category = '电影'; manifest.results[0].confidence = 0.4;
     expect(() => validateManifest(manifest, dataset)).toThrow('阈值');
   });
+  it('requires only available aids, accepts legacy unavailable results without changing the resume hash, and rejects foreign aids', async () => {
+    const mixed = structuredClone(dataset);
+    mixed.videos.push({ ...mixed.videos[0], aid: 2, unavailable: true });
+    const manifest = fixture();
+    expect(validateManifest(manifest, mixed).results.map(result => result.aid)).toEqual([1]);
+    manifest.results.push({ aid: 2, category: '不确定', confidence: 0, reason: '视频不可用' });
+    const legacy = validateManifest(manifest, mixed);
+    expect(await manifestHash(validateManifest(legacy, mixed))).toBe(await manifestHash(legacy));
+    manifest.results = [{ aid: 2, category: '不确定', confidence: 0 }];
+    expect(() => validateManifest(manifest, mixed)).toThrow('完整覆盖');
+    manifest.results = [...fixture().results, { aid: 999, category: '不确定', confidence: 0 }];
+    expect(() => validateManifest(manifest, mixed)).toThrow('完整覆盖');
+  });
   it('hash ignores object property order but changes when prompt/results change', async () => {
     const manifest = fixture();
     const reordered = Object.fromEntries(Object.entries(manifest).reverse()) as unknown as ClassificationManifest;

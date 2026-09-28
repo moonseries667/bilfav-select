@@ -60,13 +60,13 @@ export function parseClassification(
   const normalizedCategories = validateCategories(categories);
   const allowed = new Set(normalizedCategories.map(category => category.name));
   const uncertain = normalizedCategories.find(category => category.name === UNCERTAIN)!;
-  const uniqueVideos = uniqueByAid(videos);
+  const uniqueVideos = uniqueByAid(videos.filter(video => !video.unavailable));
   const videosByAid = new Map(uniqueVideos.map(video => [video.aid, video]));
   const byAid = new Map<number, ClassificationResult>();
 
   for (const video of uniqueVideos) {
     byAid.set(video.aid, makeUncertain(
-      video, uncertain.name, video.unavailable ? '视频不可用' : 'AI未返回该视频',
+      video, uncertain.name, 'AI未返回该视频',
     ));
   }
 
@@ -78,9 +78,6 @@ export function parseClassification(
   }
 
   const seen = new Set<number>();
-  for (const video of uniqueVideos) {
-    if (video.unavailable) seen.add(video.aid);
-  }
   const safeThreshold = Number.isFinite(threshold) ? clamp(threshold) : 1;
   for (const row of rows) {
     if (!isRecord(row) || !Number.isSafeInteger(row.aid) || (row.aid as number) <= 0) continue;
@@ -138,14 +135,10 @@ export async function classifyDataset(
   const retryLimit = integerInRange(settings.maxRetries, 0, MAX_RETRIES, DEFAULT_SETTINGS.maxRetries);
   const prompt = buildSystemPrompt(settings.prompt, categories);
   // Fail before a run can be mistaken for completed uncertain results or applied downstream.
-  if (provider === defaultAIProvider) buildAIRequest(prompt, '', settings);
+  if (provider === defaultAIProvider && allVideos.some(video => !video.unavailable)) buildAIRequest(prompt, '', settings);
   const availableVideos = allVideos.filter(video => !video.unavailable);
   const results = new Map<number, ClassificationResult>();
   const uncertain = categories.find(category => category.name === UNCERTAIN)!.name;
-
-  for (const video of allVideos) {
-    if (video.unavailable) results.set(video.aid, makeUncertain(video, uncertain, '视频不可用'));
-  }
 
   const batchCount = Math.ceil(availableVideos.length / batchSize);
   let failedBatches = 0;
@@ -178,12 +171,12 @@ export async function classifyDataset(
     }
   }
 
-  const finalResults = allVideos.map(video =>
+  const finalResults = availableVideos.map(video =>
     results.get(video.aid) ?? makeUncertain(video, uncertain, 'AI未返回该视频'));
   const stats = buildStats(finalResults, categories);
   hooks.log?.(
-    `AI分类完成：${allVideos.length} 个视频，${stats[UNCERTAIN] ?? 0} 个不确定，` +
-    `${allVideos.filter(video => video.unavailable).length} 个不可用；` +
+    `AI分类完成：${availableVideos.length} 个可用视频，${stats[UNCERTAIN] ?? 0} 个不确定，` +
+    `跳过 ${allVideos.length - availableVideos.length} 个失效视频；` +
     `${failedBatches} 个批次失败，重试 ${retriesUsed} 次。`,
     failedBatches > 0 ? 'warning' : 'info',
   );

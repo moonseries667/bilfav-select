@@ -138,6 +138,8 @@ export interface BilibiliAdapter {
   deleteFolder(id: FolderId): Promise<void>;
   listFolderVideos(id: FolderId): Promise<FolderVideo[]>;
   getVideoMetadata(aid: number, bvid?: string): Promise<VideoMetadata>;
+  /** Availability already confirmed by this adapter; never initiates a request. */
+  isVideoUnavailable?(aid: number): boolean;
   copyVideos(sourceId: FolderId, targetId: FolderId, aids: number[]): Promise<void>;
   getFolderAidSet(id: FolderId): Promise<Set<number>>;
 }
