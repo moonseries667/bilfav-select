@@ -26,8 +26,7 @@ const DEFAULT_BASE_URLS: Record<AISettings['provider'], string> = {
 
 const REQUEST_TIMEOUT_MS = 90_000;
 
-/** Builds the standard chat-completions request shared by OpenAI, DeepSeek and Ollama. */
-export function buildAIRequest(system: string, user: string, settings: AISettings): AIRequest {
+function getBaseUrl(settings: AISettings): URL {
   const baseUrl = (settings.baseUrl.trim() || DEFAULT_BASE_URLS[settings.provider]).replace(/\/+$/, '');
   let parsed: URL;
   try {
@@ -40,15 +39,71 @@ export function buildAIRequest(system: string, user: string, settings: AISetting
       parsed.username || parsed.password || parsed.search || parsed.hash) {
     throw new AppError('AI 服务地址只能包含 HTTP(S) 主机和路径', 'invalid');
   }
+  return parsed;
+}
 
-  if (!settings.model.trim()) throw new AppError('请先设置 AI 模型名称', 'invalid');
+function getHeaders(settings: AISettings): Record<string, string> {
   if (settings.provider !== 'ollama' && !settings.apiKey.trim()) {
     throw new AppError('请先设置 AI API Key', 'invalid');
   }
   if (/[\r\n]/.test(settings.apiKey)) throw new AppError('AI API Key 格式无效', 'invalid');
-
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (settings.apiKey) headers.Authorization = `Bearer ${settings.apiKey}`;
+  return headers;
+}
+
+function safeRequestError(error: unknown, operation: '模型列表' | 'AI'): AppError {
+  if (error instanceof AppError && error.code === 408) {
+    return new AppError(`${operation}请求超时，请检查服务地址后重试`, 'network', 408, true);
+  }
+  return new AppError(`${operation}网络请求失败，请检查服务地址和网络连接`, 'network', undefined, true);
+}
+
+function statusError(status: number, operation: '模型列表' | 'AI'): AppError {
+  const kind = status === 429 ? 'rate-limit' : 'api';
+  const retryable = status === 429 || status === 408 || status === 425 || status >= 500;
+  const message = status === 401 ? 'AI 服务鉴权失败，请检查 API Key' :
+    status === 403 ? 'AI 服务拒绝访问，请检查权限' :
+    status === 404 ? 'AI 服务接口不存在，请检查 Base URL' :
+    status === 429 ? 'AI 服务请求过于频繁，请稍后重试' :
+    status >= 500 ? 'AI 服务暂时不可用，请稍后重试' :
+    `${operation}请求失败，请检查服务设置`;
+  return new AppError(message, kind, status, retryable);
+}
+
+/** Lists model identifiers from the provider's OpenAI-compatible /models endpoint. */
+export async function fetchModels(settings: AISettings): Promise<string[]> {
+  const parsed = getBaseUrl(settings);
+  const headers = getHeaders(settings);
+  const url = `${parsed.origin}${parsed.pathname.replace(/\/+$/, '')}/models`;
+  let response;
+  try {
+    response = await gmFetch(url, { method: 'GET', headers, timeout: REQUEST_TIMEOUT_MS, anonymous: true });
+  } catch (error) {
+    throw safeRequestError(error, '模型列表');
+  }
+  if (response.status < 200 || response.status >= 300) throw statusError(response.status, '模型列表');
+
+  let envelope: unknown;
+  try {
+    envelope = JSON.parse(response.responseText) as unknown;
+  } catch {
+    throw new AppError('模型列表响应格式无效', 'invalid');
+  }
+  if (!isRecord(envelope) || !Array.isArray(envelope.data) ||
+      envelope.data.some(item => !isRecord(item) || typeof item.id !== 'string')) {
+    throw new AppError('模型列表响应格式无效', 'invalid');
+  }
+  return [...new Set(envelope.data.map(item => (item as Record<string, unknown>).id as string)
+    .map(id => id.trim()).filter(Boolean))];
+}
+
+/** Builds the standard chat-completions request shared by OpenAI, DeepSeek and Ollama. */
+export function buildAIRequest(system: string, user: string, settings: AISettings): AIRequest {
+  const parsed = getBaseUrl(settings);
+
+  if (!settings.model.trim()) throw new AppError('请先设置 AI 模型名称', 'invalid');
+  const headers = getHeaders(settings);
 
   return {
     url: `${parsed.origin}${parsed.pathname.replace(/\/+$/, '')}/chat/completions`,
@@ -60,7 +115,6 @@ export function buildAIRequest(system: string, user: string, settings: AISetting
         { role: 'system', content: system },
         { role: 'user', content: user },
       ],
-      temperature: 0.1,
     }),
     timeout: REQUEST_TIMEOUT_MS,
     anonymous: true,
@@ -69,6 +123,14 @@ export function buildAIRequest(system: string, user: string, settings: AISetting
 
 export class OpenAICompatibleProvider implements AIProvider {
   async complete(system: string, user: string, settings: AISettings): Promise<string> {
+    return (await this.completeWithMetadata(system, user, settings)).content;
+  }
+
+  async completeWithMetadata(system: string, user: string, settings: AISettings): Promise<{
+    content: string;
+    model?: string;
+    usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number };
+  }> {
     const request = buildAIRequest(system, user, settings);
     let response;
     try {
@@ -80,31 +142,44 @@ export class OpenAICompatibleProvider implements AIProvider {
         anonymous: true,
       });
     } catch (error) {
-      const code = error instanceof AppError ? error.code : undefined;
-      const retryable = error instanceof AppError ? error.retryable : true;
-      const kind = error instanceof AppError ? error.kind : 'network';
-      throw new AppError('AI 网络请求失败', kind, code, retryable);
+      throw safeRequestError(error, 'AI');
     }
 
     if (response.status < 200 || response.status >= 300) {
-      const retryable = response.status === 412 || response.status === 429 ||
-        response.status === 408 || response.status === 425 || response.status >= 500;
-      throw new AppError('AI 服务请求失败',
-        response.status === 412 || response.status === 429 ? 'rate-limit' : 'api',
-        response.status, retryable);
+      throw statusError(response.status, 'AI');
     }
 
     let envelope: unknown;
     try {
       envelope = JSON.parse(response.responseText) as unknown;
     } catch {
-      throw new AppError('AI 服务响应格式无效', 'invalid');
+      throw new AppError('AI 服务响应不是有效 JSON', 'invalid');
     }
 
     const content = getMessageContent(envelope);
-    if (content === null) throw new AppError('AI 服务未返回分类内容', 'invalid');
-    return content;
+    if (content === null) throw new AppError('AI 服务响应缺少有效的 choices 内容', 'invalid');
+    if (!content.trim()) throw new AppError('AI 服务返回了空内容', 'invalid');
+    return {
+      content,
+      ...(isRecord(envelope) && typeof envelope.model === 'string' ? { model: envelope.model } : {}),
+      ...(isRecord(envelope) ? { usage: getUsage(envelope.usage) } : {}),
+    };
   }
+}
+
+function getUsage(value: unknown): { promptTokens?: number; completionTokens?: number; totalTokens?: number } | undefined {
+  if (!isRecord(value)) return undefined;
+  const usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number } = {};
+  if (typeof value.prompt_tokens === 'number' && Number.isFinite(value.prompt_tokens) && value.prompt_tokens >= 0) {
+    usage.promptTokens = value.prompt_tokens;
+  }
+  if (typeof value.completion_tokens === 'number' && Number.isFinite(value.completion_tokens) && value.completion_tokens >= 0) {
+    usage.completionTokens = value.completion_tokens;
+  }
+  if (typeof value.total_tokens === 'number' && Number.isFinite(value.total_tokens) && value.total_tokens >= 0) {
+    usage.totalTokens = value.total_tokens;
+  }
+  return Object.keys(usage).length ? usage : undefined;
 }
 
 function getMessageContent(value: unknown): string | null {

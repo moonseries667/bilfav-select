@@ -4,9 +4,9 @@ import { AppError } from './lib/errors';
 
 // The local preview never contacts Bilibili or an AI provider.
 const FIXTURES: VideoMetadata[] = [
-  { aid: 1001, bvid: 'BVdemo1001', title: '土耳其电影 · 完整作品', description: '剧情长片完整正片', tags: ['土耳其', '电影', '剧情'], tname: '影视', duration: 5400, upper: { name: '电影资料馆' } },
-  { aid: 1002, bvid: 'BVdemo1002', title: '如何拍出电影感旅行视频', description: '摄影剪辑教程', tags: ['电影', '教程', '摄影'], tname: '知识', duration: 960, upper: { name: '影像教室' } },
-  { aid: 1003, title: '钢琴现场 · 夜曲', description: '钢琴音乐会演出', tags: ['音乐', '钢琴', '现场'], tname: '音乐', duration: 480, upper: { name: '音乐现场' } },
+  { aid: 1001, bvid: 'BVdemo1001', title: 'MMD 模型舞蹈展示', description: '使用 MMD 制作的模型演出成片', tags: ['MMD', '舞蹈'], tname: '动画', duration: 180, upper: { name: '模型工坊' } },
+  { aid: 1002, bvid: 'BVdemo1002', title: '漫画人物绘画上色教程', description: '演示人物绘画、配色和上色技巧', tags: ['漫画', '绘画', '教程'], tname: '绘画', duration: 960, upper: { name: '绘画教室' } },
+  { aid: 1003, title: '科普：为什么天空是蓝色的？', description: '解释光的散射及天空颜色的科学原理', tags: ['科普', '物理'], tname: '科学科普', duration: 480, upper: { name: '科学时间' } },
   { aid: 1004, title: '失效视频', description: '', tags: [], unavailable: true },
 ];
 type DemoState = { folders: Folder[]; contents: Record<string, number[]>; nextId: number };
@@ -64,10 +64,14 @@ export class DemoBilibiliAdapter implements BilibiliAdapter {
 }
 export const demoAI = {
   async complete(_system: string, user: string): Promise<string> {
-    const output = FIXTURES.filter(video => user.includes(String(video.aid))).map(video => ({
-      aid: video.aid, category: video.aid === 1001 ? '电影' : video.aid === 1002 ? '知识' : '音乐',
-      confidence: 0.96, reason: '本地演示样例响应',
-    }));
+    const allowed = JSON.parse(user.split('allowedCategoryNames = ')[1].split('\n')[0]) as string[];
+    const videos = JSON.parse(user.slice(user.indexOf('videos = ') + 'videos = '.length)) as VideoMetadata[];
+    const output = videos.map(video => {
+      const text = `${video.title} ${video.description}`;
+      const category = /MMD/i.test(text) ? 'MMD' : /绘画/.test(text) ? '绘画' : /科普|科学原理/.test(text) ? '科普' : '不确定';
+      return { aid: video.aid, category: allowed.includes(category) ? category : '不确定',
+        confidence: 0.96, reason: '本地演示样例响应' };
+    });
     return JSON.stringify(output);
   },
 };

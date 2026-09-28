@@ -1,10 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import { DEFAULT_SETTINGS } from '../src/defaults';
-import { AppError } from '../src/lib/errors';
+import { AppError, PauseError } from '../src/lib/errors';
 import type {
-  CategoryDefinition, RuntimeHooks, Settings, VideoDataset, VideoRecord,
+  CategoryDefinition, ClassificationDraft, RuntimeHooks, Settings, VideoDataset, VideoRecord,
 } from '../src/types';
-import { classifyDataset, parseClassification, validateCategories } from '../src/ai/classifier';
+import { classifyDataset, parseClassification, parseClassificationBatch, validateCategories } from '../src/ai/classifier';
 import { buildAIRequest, defaultAIProvider, type AIProvider } from '../src/ai/provider';
 
 const categories: CategoryDefinition[] = [
@@ -216,18 +216,18 @@ describe('classifyDataset', () => {
     expect(manifest.stats).toEqual({ 电影: 0, 知识: 0, 不确定: 0 });
   });
 
-  it('excludes unavailable metadata from mixed AI batches and ignores its returned result', async () => {
+  it('excludes unavailable metadata from mixed AI batches', async () => {
     const complete = vi.fn(async (_system: string, user: string) => {
       const sent = JSON.parse(user.slice(user.indexOf('videos = ') + 'videos = '.length));
       expect(sent.map((item: { aid: number }) => item.aid)).toEqual([17]);
-      return '[{"aid":17,"category":"电影","confidence":0.9},{"aid":18,"category":"电影","confidence":1}]';
+      return '[{"aid":17,"category":"电影","confidence":0.9}]';
     });
     const manifest = await classifyDataset(dataset([video(17), video(18, { unavailable: true })]), settings(), {}, { complete });
     expect(manifest.results.map(result => result.aid)).toEqual([17]);
     expect(manifest.stats).toEqual({ 电影: 1, 知识: 0, 不确定: 0 });
   });
 
-  it('bounds batch retries and makes every item in the exhausted batch uncertain', async () => {
+  it('bounds batch retries and leaves exhausted batches pending instead of creating uncertain results', async () => {
     const complete = vi.fn(async () => {
       throw new AppError('sensitive body and key must not escape', 'rate-limit', 429, true);
     });
@@ -239,16 +239,18 @@ describe('classifyDataset', () => {
     };
     const config = settings({ maxRetries: 2, cooldownMs: 5000 });
 
-    const manifest = await classifyDataset(dataset([video(19)]), config, hooks, { complete });
+    let saved: ClassificationDraft | undefined;
+    await expect(classifyDataset(dataset([video(19)]), config, hooks, { complete }, {
+      save: draft => { saved = draft; },
+    })).rejects.toThrow('分类未完成');
     expect(complete).toHaveBeenCalledTimes(3);
     expect(waits).toHaveLength(2);
     expect(waits.every(ms => ms >= config.cooldownMs)).toBe(true);
-    expect(manifest.results[0]).toMatchObject({ aid: 19, category: '不确定' });
-    expect(manifest.stats).toEqual({ 电影: 0, 知识: 0, 不确定: 1 });
+    expect(saved?.results).toEqual([]);
     expect(logs.join('\n')).not.toContain('sensitive body');
     expect(logs.join('\n')).not.toContain(config.apiKey);
     expect(logs.join('\n')).not.toContain(config.baseUrl);
-    expect(logs.some(message => message.includes('失败') && message.includes('重试 2 次'))).toBe(true);
+    expect(logs.some(message => message.includes('失败') && message.includes('重试'))).toBe(true);
   });
 
   it('rejects missing credentials for the real provider before starting classification', async () => {
@@ -271,6 +273,76 @@ describe('classifyDataset', () => {
     expect(manifest.results).toHaveLength(1);
     expect(manifest.createdAt).toBe(fixedDate.toISOString());
     expect(checkpoint).toHaveBeenCalled();
+  });
+});
+
+describe('strict batches and classification recovery', () => {
+  it.each([
+    'not-json', '[]',
+    '[{"aid":1,"category":"电影","confidence":2}]',
+    '[{"aid":1,"category":"未知","confidence":0.8}]',
+    '[{"aid":2,"category":"电影","confidence":0.8}]',
+    '[{"aid":1,"category":"电影","confidence":0.8},{"aid":1,"category":"电影","confidence":0.8}]',
+  ])('rejects incomplete or invalid output instead of manufacturing uncertain results: %s', raw => {
+    expect(() => parseClassificationBatch(raw, [video(1)], categories, 0.7)).toThrow(AppError);
+  });
+
+  it('keeps valid low confidence or explicit uncertainty as content judgements', () => {
+    expect(parseClassificationBatch('[{"aid":1,"category":"电影","confidence":0.5}]', [video(1)], categories, 0.7)[0].category).toBe('不确定');
+    expect(parseClassificationBatch('[{"aid":1,"category":"不确定","confidence":0.9}]', [video(1)], categories, 0.7)[0].category).toBe('不确定');
+  });
+
+  it('persists successful batches and resumes without calling the model for completed videos', async () => {
+    const data = dataset([video(1), video(2), video(3)]);
+    const config = settings({ aiBatchSize: 1, maxRetries: 0 });
+    let saved!: ClassificationDraft;
+    const complete = vi.fn(async (_system: string, user: string) => {
+      const aid = JSON.parse(user.slice(user.indexOf('videos = ') + 9))[0].aid;
+      if (aid === 2) throw new AppError('temporary failure', 'network', undefined, true);
+      return JSON.stringify([{ aid, category: '电影', confidence: 0.9 }]);
+    });
+    await expect(classifyDataset(data, config, {}, { complete }, { save: draft => { saved = draft; } })).rejects.toThrow('分类未完成');
+    expect(saved.results.map(result => result.aid)).toEqual([1]);
+    expect(saved.signature).not.toContain(config.apiKey);
+    const initialRun = saved.runId;
+    const resumedCalls: number[] = [];
+    const manifest = await classifyDataset(data, config, {}, {
+      complete: async (_system, user) => {
+        const aid = JSON.parse(user.slice(user.indexOf('videos = ') + 9))[0].aid;
+        resumedCalls.push(aid);
+        return JSON.stringify([{ aid, category: '电影', confidence: 0.9 }]);
+      },
+    }, { draft: saved, save: draft => { saved = draft; } });
+    expect(resumedCalls).toEqual([2, 3]);
+    expect(manifest.runId).toBe(initialRun);
+    expect(manifest.results.map(result => result.aid)).toEqual([1, 2, 3]);
+  });
+
+  it('retries malformed model output and refuses to mix changed rules into a saved run', async () => {
+    let saved!: ClassificationDraft;
+    const data = dataset([video(1)]);
+    const config = settings({ maxRetries: 1 });
+    const complete = vi.fn().mockResolvedValueOnce('broken').mockResolvedValue('[{"aid":1,"category":"知识","confidence":0.9}]');
+    await classifyDataset(data, config, { sleep: async () => {} }, { complete }, { save: draft => { saved = draft; } });
+    expect(complete).toHaveBeenCalledTimes(2);
+    const unused = vi.fn();
+    await expect(classifyDataset(data, { ...config, prompt: 'changed' }, {}, { complete: unused }, { draft: saved, save: vi.fn() })).rejects.toThrow('已变化');
+    expect(unused).not.toHaveBeenCalled();
+  });
+
+  it('saves the last in-flight batch before pausing and can finish without repeating that call', async () => {
+    let saved!: ClassificationDraft;
+    let paused = false;
+    const data = dataset([video(1)]);
+    const config = settings();
+    await expect(classifyDataset(data, config, { checkpoint: () => { if (paused) throw new PauseError(); } }, {
+      complete: async () => { paused = true; return '[{"aid":1,"category":"知识","confidence":0.9}]'; },
+    }, { save: draft => { saved = draft; } })).rejects.toBeInstanceOf(PauseError);
+    expect(saved.results).toHaveLength(1);
+    const complete = vi.fn();
+    const manifest = await classifyDataset(data, config, {}, { complete }, { draft: saved, save: vi.fn() });
+    expect(complete).not.toHaveBeenCalled();
+    expect(manifest.results).toHaveLength(1);
   });
 });
 

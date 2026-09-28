@@ -37,6 +37,18 @@
 #bilfav-select-root .bf-code { font-family: Consolas, monospace; font-size: 12px; }
 #bilfav-select-root .bf-two-columns { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0 12px; }
 #bilfav-select-root .bf-label-hint { color: var(--bf-muted); font-weight: 400; }
+#bilfav-select-root h4 { margin: 20px 0 12px; font-size: 14px; }
+#bilfav-select-root h4:first-child { margin-top: 0; }
+#bilfav-select-root .bf-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0 12px; }
+#bilfav-select-root .bf-actions button { flex: 1; }
+#bilfav-select-root .bf-category-list { display: grid; gap: 12px; }
+#bilfav-select-root .bf-category-row { padding: 12px; border: 1px solid var(--bf-border); border-radius: 8px; background: #fbfdfd; }
+#bilfav-select-root .bf-category-row label:last-child { margin-bottom: 0; }
+#bilfav-select-root .bf-category-heading { display: flex; gap: 8px; align-items: end; margin-bottom: 12px; }
+#bilfav-select-root .bf-category-heading label { flex: 1; min-width: 0; margin-bottom: 0; }
+#bilfav-select-root .bf-remove { color: #9a3412; flex-shrink: 0; }
+#bilfav-select-root .bf-category-import { margin: 12px 0; }
+#bilfav-select-root .bf-classification-draft { border-left: 3px solid var(--bf-primary); padding-left: 12px; margin-top: 16px; }
 #bilfav-select-root details { margin: 10px 0; }
 #bilfav-select-root summary { padding: 10px 0; min-height: 44px; cursor: pointer; font-weight: 600; }
 #bilfav-select-root .bf-reserved { padding: 10px; background: var(--bf-tint); border-radius: 6px; font-size: 12px; margin-top: 8px; }

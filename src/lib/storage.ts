@@ -2,6 +2,7 @@ import type { AppData, Repository, Settings, ExecutionState } from '../types';
 import { DEFAULT_SETTINGS } from '../defaults';
 import { gmGetValue, gmSetValue } from './gm';
 import { AppError } from './errors';
+import legacyPrompt from '../prompts/classifier-legacy.txt?raw';
 
 const DATA_KEY = 'bilfav-select:data:v1';
 const SETTINGS_KEY = 'bilfav-select:settings:v1';
@@ -24,7 +25,12 @@ export class GMRepository implements Repository {
   save(data: AppData): void { gmSetValue(DATA_KEY, structuredClone(data)); }
 }
 export function loadSettings(): Settings {
-  return { ...structuredClone(DEFAULT_SETTINGS), ...gmGetValue<Partial<Settings>>(SETTINGS_KEY, {}) };
+  const result = { ...structuredClone(DEFAULT_SETTINGS), ...gmGetValue<Partial<Settings>>(SETTINGS_KEY, {}) };
+  // Replace only the exact former built-in prompt; preserve all user-written prompts and tables.
+  if (result.prompt.replace(/\r\n/g, '\n').trim() === legacyPrompt.replace(/\r\n/g, '\n').trim()) {
+    result.prompt = DEFAULT_SETTINGS.prompt;
+  }
+  return result;
 }
 export function saveSettings(settings: Settings): void {
   // Settings are kept separately. The API key is never included in data, manifest or log exports.

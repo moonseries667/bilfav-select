@@ -3,7 +3,7 @@ import { AppError, PauseError } from '../lib/errors';
 import { backoff, jitter } from '../lib/timing';
 import { UNCERTAIN } from '../types';
 import type {
-  AISettings, CategoryDefinition, ClassificationManifest, ClassificationResult,
+  AISettings, CategoryDefinition, ClassificationDraft, ClassificationManifest, ClassificationResult,
   RuntimeHooks, Settings, VideoDataset, VideoRecord,
 } from '../types';
 import { extractJsonValue } from './json';
@@ -14,6 +14,11 @@ export const PROMPT_VERSION = 1;
 const MANIFEST_VERSION = 1;
 const MAX_BATCH_SIZE = 50;
 const MAX_RETRIES = 5;
+
+export interface ClassificationCheckpoint {
+  draft?: ClassificationDraft;
+  save: (draft: ClassificationDraft) => void;
+}
 
 /** Validates and returns a normalized category snapshot with exactly one reserved category. */
 export function validateCategories(input: unknown): CategoryDefinition[] {
@@ -115,11 +120,47 @@ export function parseClassification(
   return uniqueVideos.map(video => byAid.get(video.aid)!);
 }
 
+/** Incomplete or malformed service output is an execution failure, not a content judgement. */
+export function parseClassificationBatch(
+  raw: string, videos: VideoRecord[], categories: CategoryDefinition[], threshold: number,
+): ClassificationResult[] {
+  let rows: unknown[];
+  try { rows = getRows(extractJsonValue(raw)); }
+  catch { throw new AppError('AI 返回的分类 JSON 无效，当前批次待重试', 'invalid', undefined, true); }
+  const expected = new Set(videos.filter(video => !video.unavailable).map(video => video.aid));
+  const allowed = new Set(validateCategories(categories).map(category => category.name));
+  const seen = new Set<number>();
+  for (const row of rows) {
+    if (!isRecord(row) || !Number.isSafeInteger(row.aid) || !expected.has(Number(row.aid)) ||
+        seen.has(Number(row.aid)) || typeof row.category !== 'string' || !allowed.has(row.category) ||
+        typeof row.confidence !== 'number' || !Number.isFinite(row.confidence) ||
+        row.confidence < 0 || row.confidence > 1 ||
+        (row.reason !== undefined && typeof row.reason !== 'string')) {
+      throw new AppError('AI 分类结果包含未知/重复视频、未知类别或无效置信度，当前批次待重试', 'invalid', undefined, true);
+    }
+    seen.add(Number(row.aid));
+  }
+  if (seen.size !== expected.size) throw new AppError('AI 未完整返回当前批次的全部视频，当前批次待重试', 'invalid', undefined, true);
+  return parseClassification(raw, videos, categories, threshold);
+}
+
+export function classificationSignature(dataset: VideoDataset, settings: Settings): string {
+  return JSON.stringify({
+    datasetVersion: dataset.version, datasetUpdatedAt: dataset.updatedAt,
+    aids: uniqueByAid(dataset.videos.filter(video => !video.unavailable)).map(video => video.aid),
+    categories: validateCategories(settings.categories),
+    prompt: buildSystemPrompt(settings.prompt, settings.categories),
+    threshold: settings.confidenceThreshold,
+    provider: settings.provider, baseUrl: settings.baseUrl.trim().replace(/\/+$/, ''), model: settings.model.trim(),
+  });
+}
+
 export async function classifyDataset(
   dataset: VideoDataset,
   settings: Settings,
   hooks: RuntimeHooks = {},
   provider: AIProvider = defaultAIProvider,
+  checkpoint?: ClassificationCheckpoint,
 ): Promise<ClassificationManifest> {
   const categories = validateCategories(settings.categories);
   const allVideos = uniqueByAid(dataset.videos);
@@ -138,54 +179,66 @@ export async function classifyDataset(
   if (provider === defaultAIProvider && allVideos.some(video => !video.unavailable)) buildAIRequest(prompt, '', settings);
   const availableVideos = allVideos.filter(video => !video.unavailable);
   const results = new Map<number, ClassificationResult>();
-  const uncertain = categories.find(category => category.name === UNCERTAIN)!.name;
-
-  const batchCount = Math.ceil(availableVideos.length / batchSize);
-  let failedBatches = 0;
-  let batchesCompleted = 0;
-  let retriesUsed = 0;
-  for (let offset = 0; offset < availableVideos.length; offset += batchSize) {
-    hooks.checkpoint?.();
-    const batch = availableVideos.slice(offset, offset + batchSize);
-    const user = buildUserPrompt(batch, categories);
-    const outcome = await completeWithRetry(provider, prompt, user, settings, retryLimit, hooks);
-    retriesUsed += Math.max(0, outcome.attempts - 1);
-
-    if (outcome.raw === null) {
-      failedBatches += 1;
-      hooks.log?.(`AI分类批次 ${batchesCompleted + 1}/${batchCount} 失败，相关视频将归入「${UNCERTAIN}」。`, 'warning');
-      for (const video of batch) results.set(video.aid, makeUncertain(video, uncertain, 'AI请求失败'));
-    } else {
-      const parsed = parseClassification(outcome.raw, batch, categories, threshold);
-      for (const result of parsed) results.set(result.aid, result);
+  const now = hooks.now?.() ?? new Date();
+  const signature = classificationSignature(dataset, settings);
+  const previous = checkpoint?.draft;
+  if (previous && (previous.version !== 1 || previous.signature !== signature)) {
+    throw new AppError('数据集、分类规则或模型已变化，请点击「重新分类并重建」开始新一轮', 'invalid');
+  }
+  if (previous) {
+    if (!Array.isArray(previous.results) || typeof previous.runId !== 'string' || !previous.runId ||
+        !Number.isFinite(Date.parse(previous.createdAt))) throw new AppError('保存的分类进度格式无效，请重新分类', 'invalid');
+    const completedAids = new Set(previous.results.map(result => result.aid));
+    const completedVideos = availableVideos.filter(video => completedAids.has(video.aid));
+    for (const result of parseClassificationBatch(JSON.stringify(previous.results), completedVideos, categories, threshold)) {
+      results.set(result.aid, result);
     }
-
-    batchesCompleted += 1;
+  }
+  const draft: ClassificationDraft = {
+    version: 1, signature, runId: previous?.runId ?? createRunId(now),
+    createdAt: previous?.createdAt ?? now.toISOString(), results: [...results.values()],
+  };
+  const saveProgress = () => {
+    draft.results = availableVideos.flatMap(video => results.has(video.aid) ? [results.get(video.aid)!] : []);
+    checkpoint?.save(structuredClone(draft));
+  };
+  saveProgress();
+  const pending = availableVideos.filter(video => !results.has(video.aid));
+  let retriesUsed = 0;
+  hooks.progress?.({ phase: 'classifying', completed: results.size, total: availableVideos.length,
+    message: `AI分类 ${results.size}/${availableVideos.length} 个视频` });
+  for (let offset = 0; offset < pending.length; offset += batchSize) {
+    hooks.checkpoint?.();
+    const batch = pending.slice(offset, offset + batchSize);
+    const user = buildUserPrompt(batch, categories);
+    const outcome = await completeWithRetry(provider, prompt, user, settings, retryLimit, hooks,
+      raw => parseClassificationBatch(raw, batch, categories, threshold));
+    retriesUsed += Math.max(0, outcome.attempts - 1);
+    for (const result of outcome.results) results.set(result.aid, result);
+    saveProgress();
     hooks.progress?.({
-      phase: 'classifying', completed: batchesCompleted, total: batchCount,
-      message: `AI分类 ${batchesCompleted}/${batchCount}`,
+      phase: 'classifying', completed: results.size, total: availableVideos.length,
+      message: `AI分类 ${results.size}/${availableVideos.length} 个视频`,
     });
-    if (offset + batchSize < availableVideos.length && settings.requestDelayMs > 0) {
+    if (offset + batchSize < pending.length && settings.requestDelayMs > 0) {
       hooks.checkpoint?.();
       await (hooks.sleep ?? defaultSleep)(jitter(settings.requestDelayMs));
     }
   }
 
-  const finalResults = availableVideos.map(video =>
-    results.get(video.aid) ?? makeUncertain(video, uncertain, 'AI未返回该视频'));
+  hooks.checkpoint?.();
+  const finalResults = availableVideos.map(video => results.get(video.aid)!);
   const stats = buildStats(finalResults, categories);
   hooks.log?.(
     `AI分类完成：${availableVideos.length} 个可用视频，${stats[UNCERTAIN] ?? 0} 个不确定，` +
     `跳过 ${allVideos.length - availableVideos.length} 个失效视频；` +
-    `${failedBatches} 个批次失败，重试 ${retriesUsed} 次。`,
-    failedBatches > 0 ? 'warning' : 'info',
+    `重试 ${retriesUsed} 次。`, 'info',
   );
-  const now = hooks.now?.() ?? new Date();
 
   return {
     version: MANIFEST_VERSION,
-    runId: createRunId(now),
-    createdAt: now.toISOString(),
+    runId: draft.runId,
+    createdAt: draft.createdAt,
     datasetVersion: dataset.version,
     datasetUpdatedAt: dataset.updatedAt,
     categories: categories.map(category => ({ ...category })),
@@ -197,7 +250,7 @@ export async function classifyDataset(
   };
 }
 
-function buildSystemPrompt(promptValue: string, categories: CategoryDefinition[]): string {
+export function buildSystemPrompt(promptValue: string, categories: CategoryDefinition[]): string {
   const basePrompt = promptValue.trim() || DEFAULT_SETTINGS.prompt;
   const allowedCategories = JSON.stringify(categories, null, 2);
   return [
@@ -210,7 +263,7 @@ function buildSystemPrompt(promptValue: string, categories: CategoryDefinition[]
   ].join('\n\n');
 }
 
-function buildUserPrompt(videos: VideoRecord[], categories: CategoryDefinition[]): string {
+export function buildUserPrompt(videos: VideoRecord[], categories: CategoryDefinition[]): string {
   const categoryNames = JSON.stringify(categories.map(category => category.name));
   const input = videos.map(video => ({
     aid: video.aid,
@@ -236,7 +289,8 @@ async function completeWithRetry(
   settings: Settings,
   maxRetries: number,
   hooks: RuntimeHooks,
-): Promise<{ raw: string | null; attempts: number }> {
+  parse: (raw: string) => ClassificationResult[],
+): Promise<{ results: ClassificationResult[]; attempts: number }> {
   const aiSettings: AISettings = {
     provider: settings.provider,
     baseUrl: settings.baseUrl,
@@ -247,11 +301,16 @@ async function completeWithRetry(
   for (let attempt = 1; attempt <= maxRetries + 1; attempt += 1) {
     hooks.checkpoint?.();
     try {
-      return { raw: await provider.complete(system, user, aiSettings), attempts: attempt };
+      return { results: parse(await provider.complete(system, user, aiSettings)), attempts: attempt };
     } catch (error) {
       if (error instanceof PauseError || (error instanceof AppError && error.kind === 'paused')) throw error;
       const { code, retryable } = getRetryInfo(error);
-      if (!retryable || attempt > maxRetries) return { raw: null, attempts: attempt };
+      if (!retryable || attempt > maxRetries) {
+        const codeText = code ? `（HTTP ${code}）` : '';
+        const detail = error instanceof AppError ? error.message : 'AI 网络或服务错误';
+        throw new AppError(`分类未完成${codeText}：${detail}；已保存完成批次，可继续分类。上一轮收藏夹尚未重建。`,
+          error instanceof AppError ? error.kind : 'network', code, retryable);
+      }
 
       const configuredCooldown = integerInRange(settings.cooldownMs, 0, 120_000, 30_000);
       const waitMs = code === 412 || code === 429
@@ -260,13 +319,13 @@ async function completeWithRetry(
       const jitteredWait = jitter(waitMs);
       const safeWait = Math.min(120_000,
         code === 412 || code === 429 ? Math.max(configuredCooldown, jitteredWait) : jitteredWait);
-      hooks.log?.(`AI分类请求暂时失败（${code === 412 || code === 429 ? `HTTP ${code}` : '网络或服务错误'}），${Math.ceil(safeWait / 1000)} 秒后重试。`, 'warning');
+      hooks.log?.(`AI分类请求或结果校验失败${code ? `（HTTP ${code}）` : ''}，${Math.ceil(safeWait / 1000)} 秒后重试。`, 'warning');
       hooks.checkpoint?.();
       await (hooks.sleep ?? defaultSleep)(safeWait);
     }
   }
 
-  return { raw: null, attempts: maxRetries + 1 };
+  throw new AppError('分类未完成，请继续分类', 'api');
 }
 
 function getRetryInfo(error: unknown): { code?: number; retryable: boolean } {

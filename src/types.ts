@@ -111,7 +111,19 @@ export interface PersistentState {
   generatedFolderIds: Record<string, FolderId>;
   execution: ExecutionState;
 }
-export interface AppData { state: PersistentState; dataset?: VideoDataset; manifest?: ClassificationManifest }
+export interface ClassificationDraft {
+  version: 1;
+  signature: string;
+  runId: string;
+  createdAt: string;
+  results: ClassificationResult[];
+}
+export interface AppData {
+  state: PersistentState;
+  dataset?: VideoDataset;
+  manifest?: ClassificationManifest;
+  classificationDraft?: ClassificationDraft;
+}
 export interface AISettings {
   provider: 'openai-compatible' | 'deepseek' | 'ollama';
   baseUrl: string;
