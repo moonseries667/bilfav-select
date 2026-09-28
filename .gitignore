@@ -1,1 +1,9 @@
 codex_kit
+.work/
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+*.local
