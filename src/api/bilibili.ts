@@ -66,6 +66,10 @@ const API = 'https://api.bilibili.com';
 const FOLDER_CACHE_MS = 15_000;
 const PAGE_SIZE = 20;
 const MAX_RESOURCE_PAGES = 10_000;
+// Video metadata routes report invisible, pending-review and owner-only
+// manuscripts separately from deleted videos. All are ineligible for this run.
+// https://github.com/bilibili-plugins/bilibili-api-collect/blob/master/docs/video/info.md
+const UNAVAILABLE_VIDEO_CODES = new Set([62002, 62004, 62012]);
 
 function asRecord(value: unknown): RawObject | undefined {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as RawObject : undefined;
@@ -148,6 +152,11 @@ function isUnavailableResource(media: FolderResource): boolean {
   // Bit 0 marks unavailable resources (including attr 1 and 9). Other
   // attribute bits, such as interactive videos, do not imply deletion.
   return attr !== undefined && (Math.trunc(attr) & 1) !== 0;
+}
+
+function isUnavailableVideoError(error: unknown): error is AppError {
+  return error instanceof AppError && (error.kind === 'unavailable' ||
+    (error.kind === 'api' && error.code !== undefined && UNAVAILABLE_VIDEO_CODES.has(error.code)));
 }
 
 function isBatchEndpointUnavailable(error: unknown): boolean {
@@ -362,18 +371,21 @@ export class HttpBilibiliAdapter implements BilibiliAdapter {
 
   async getVideoMetadata(aid: number, bvid?: string): Promise<VideoMetadata> {
     const validAid = requiredPositiveInteger(aid, '视频 aid');
-    const unavailable = (): VideoMetadata => ({
-      aid: validAid, ...(bvid ? { bvid } : {}), title: '已失效视频', description: '', tags: [], unavailable: true,
-    });
+    const unavailable = (reason?: string): VideoMetadata => {
+      if (!this.unavailableAids.has(validAid)) {
+        this.hooks.log?.(`已跳过不可用视频 aid ${validAid}${reason ? `（${reason}）` : ''}，不再获取标签或参与分类、复制`, 'info');
+      }
+      this.unavailableAids.add(validAid);
+      return { aid: validAid, ...(bvid ? { bvid } : {}), title: '当前不可用视频', description: '', tags: [], unavailable: true };
+    };
     if (this.unavailableAids.has(validAid)) return unavailable();
     const viewUrl = makeApiUrl('/x/web-interface/view', bvid ? { bvid } : { aid: validAid });
     let view: ViewResponse;
     try {
       view = await this.http.getData<ViewResponse>(viewUrl);
     } catch (error) {
-      if (error instanceof AppError && error.kind === 'unavailable') {
-        this.unavailableAids.add(validAid);
-        return unavailable();
+      if (isUnavailableVideoError(error)) {
+        return unavailable(error.code === undefined ? undefined : `code ${error.code}`);
       }
       throw error;
     }
@@ -383,10 +395,18 @@ export class HttpBilibiliAdapter implements BilibiliAdapter {
     }
     const state = asFiniteNumber(view.state);
     if (state !== undefined && state < 0) {
-      this.unavailableAids.add(validAid);
-      return unavailable();
+      return unavailable(`state ${state}`);
     }
-    const tagData = await this.http.getData<unknown>(makeApiUrl('/x/web-interface/view/detail/tag', { aid: validAid }));
+    let tagData: unknown;
+    try {
+      tagData = await this.http.getData<unknown>(makeApiUrl('/x/web-interface/view/detail/tag', { aid: validAid }));
+    } catch (error) {
+      // The video may cease to be accessible between the view and tag reads.
+      if (isUnavailableVideoError(error)) {
+        return unavailable(error.code === undefined ? undefined : `code ${error.code}`);
+      }
+      throw error;
+    }
     if (tagData !== null && !Array.isArray(tagData)) throw new AppError('B 站视频标签响应格式无效，拒绝保存不完整标签', 'invalid');
     const tags = (Array.isArray(tagData) ? tagData : []).map((tag: unknown) => {
       const name = asRecord(tag)?.tag_name;

@@ -2,6 +2,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { HttpBilibiliAdapter } from '../src/api/bilibili';
 import type { BilibiliRequestOptions, BilibiliTransport } from '../src/api/bilibili-http';
 import { AppError } from '../src/lib/errors';
+import { Workflow } from '../src/core/workflow';
+import { createInitialData } from '../src/lib/storage';
+import { DEFAULT_SETTINGS } from '../src/defaults';
+import { classifyDataset } from '../src/ai/classifier';
+import type { AppData } from '../src/types';
 
 type Call = { url: string; options: BilibiliRequestOptions };
 type MockResult = { status?: number; body?: unknown; responseText?: string; reject?: boolean };
@@ -146,7 +151,7 @@ describe('HttpBilibiliAdapter', () => {
     await expect(adapter.listFolderVideos(201)).rejects.toThrow('完整 ID 列表缺失');
   });
 
-  it('scans 98/99 items when the omitted ID is confirmed unavailable and never operates on that video', async () => {
+  it.each([-404, 62002, 62004, 62012])('scans 98/99 items when the omitted ID returns %i and never operates on that video', async code => {
     const medias = Array.from({ length: 98 }, (_, index) => ({ id: index + 1, type: 2, attr: 0, title: `v${index + 1}` }));
     const { mock, calls } = transport(url => {
       if (url.includes('/x/web-interface/nav')) return { body: loggedIn() };
@@ -156,7 +161,7 @@ describe('HttpBilibiliAdapter', () => {
         const pn = Number(new URL(url).searchParams.get('pn'));
         return { body: ok({ info: { media_count: 99 }, medias: medias.slice((pn - 1) * 20, pn * 20), has_more: pn < 5 }) };
       }
-      if (url.includes('/view?aid=99')) return { body: { code: -404, data: null } };
+      if (url.includes('/view?aid=99')) return { body: { code, data: null } };
       throw new Error(`Unexpected URL: ${url}`);
     });
     const adapter = new HttpBilibiliAdapter(settings(), {}, mock);
@@ -273,6 +278,77 @@ describe('HttpBilibiliAdapter', () => {
     const adapter = new HttpBilibiliAdapter(settings(), {}, mock);
     await expect(adapter.getVideoMetadata(99)).resolves.toMatchObject({ aid: 99, unavailable: true });
     expect(calls).toHaveLength(1);
+  });
+
+  it.each([-404, 11010, 62002, 62004, 62012])('skips detail code %i without tags, retries, or later video operations', async code => {
+    const { mock, calls } = transport(url => {
+      if (url.includes('/view?aid=99')) return { body: { code, message: 'untrusted echoed text', data: null } };
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    const log = vi.fn();
+    const adapter = new HttpBilibiliAdapter(settings(), { log }, mock);
+    await expect(adapter.getVideoMetadata(99)).resolves.toMatchObject({ aid: 99, unavailable: true });
+    await adapter.getVideoMetadata(99);
+    await adapter.copyVideos(500, 501, [99]);
+    expect(calls).toHaveLength(1);
+    expect(adapter.isVideoUnavailable(99)).toBe(true);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining(`code ${code}`), 'info');
+    expect(JSON.stringify(log.mock.calls)).not.toContain('untrusted echoed text');
+  });
+
+  it.each([62002, 62004, 62012])('skips a video that becomes unavailable with code %i during its tags request', async code => {
+    const { mock, calls } = transport(url => {
+      if (url.includes('/view?aid=99')) return { body: ok({ aid: 99, title: 'previously visible' }) };
+      if (url.includes('/view/detail/tag?aid=99')) return { body: { code, data: null } };
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    const adapter = new HttpBilibiliAdapter(settings(), {}, mock);
+    await expect(adapter.getVideoMetadata(99)).resolves.toMatchObject({ aid: 99, unavailable: true });
+    await adapter.getVideoMetadata(99);
+    await adapter.copyVideos(500, 501, [99]);
+    expect(calls).toHaveLength(2);
+  });
+
+  it.each([-101, -403, -400, 62099])('does not misclassify detail code %i as unavailable', async code => {
+    const { mock } = transport(() => ({ body: { code, data: null } }));
+    const adapter = new HttpBilibiliAdapter(settings(), {}, mock);
+    await expect(adapter.getVideoMetadata(99)).rejects.toMatchObject({ kind: 'api', code });
+    expect(adapter.isVideoUnavailable(99)).toBe(false);
+  });
+
+  it('does not treat code 62012 on an account endpoint as a video status', async () => {
+    const { mock } = transport(() => ({ body: { code: 62012, data: null } }));
+    await expect(new HttpBilibiliAdapter(settings(), {}, mock).getCurrentUser()).rejects.toMatchObject({ kind: 'api', code: 62012 });
+  });
+
+  it('continues HTTP-backed dataset refresh past a 62012 video and excludes it from classification', async () => {
+    const { mock, calls } = transport(url => {
+      if (url.includes('/x/web-interface/nav')) return { body: loggedIn() };
+      if (url.includes('/created/list-all')) return { body: folderList([folder(500, 2, { title: '源-旧', media_count: 3 })]) };
+      if (url.includes('/resource/list')) return { body: ok({ medias: [1, 2, 3].map(id => ({ id, type: 2, attr: 0, title: `v${id}` })), has_more: false }) };
+      const aid = Number(new URL(url).searchParams.get('aid'));
+      if (url.includes('/view?')) return { body: aid === 2 ? { code: 62012, data: null } : ok({ aid, title: `v${aid}` }) };
+      if (url.includes('/view/detail/tag')) return { body: ok([{ tag_name: 'tag' }]) };
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    let saved = createInitialData();
+    const repository = {
+      load: () => structuredClone(saved),
+      save: (data: AppData) => { saved = structuredClone(data); },
+    };
+    const adapter = new HttpBilibiliAdapter(settings(), {}, mock);
+    const workflow = new Workflow(adapter, repository);
+    await workflow.freezeSources();
+    const dataset = await workflow.refreshDataset(true);
+    expect(dataset.videos.map(video => video.aid)).toEqual([1, 3]);
+    expect(saved.dataset).toEqual(dataset);
+    expect(calls.some(call => call.url.includes('/view/detail/tag?aid=2'))).toBe(false);
+    const complete = vi.fn(async () => '[{"aid":1,"category":"不确定","confidence":0},{"aid":3,"category":"不确定","confidence":0}]');
+    const manifest = await classifyDataset(dataset, structuredClone(DEFAULT_SETTINGS), {}, { complete });
+    expect(manifest.results.map(result => result.aid)).toEqual([1, 3]);
+    expect(complete.mock.calls).toHaveLength(1);
+    await adapter.copyVideos(500, 501, [2]);
+    expect(calls.some(call => call.options.method === 'POST')).toBe(false);
   });
 
   it('rejects missing detail identity and partially malformed tag records', async () => {
