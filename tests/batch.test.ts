@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { BatchExecutor } from '../src/core/batch-executor';
 import { AppError, PauseError } from '../src/lib/errors';
-import type { BilibiliAdapter, CopyItem } from '../src/types';
+import type { BilibiliAdapter, CopyItem, DiagnosticEvent, RuntimeHooks } from '../src/types';
 
 function adapter(copyVideos: BilibiliAdapter['copyVideos']): BilibiliAdapter {
   return {
@@ -83,10 +83,29 @@ describe('BatchExecutor', () => {
   it('propagates PauseError immediately instead of treating it as a failed batch', async () => {
     const copy = vi.fn(async () => { throw new PauseError(); });
     const failed = vi.fn();
-    const executor = new BatchExecutor(adapter(copy), options({ batchSize: 4, maxRetries: 4 }));
+    const events: DiagnosticEvent[] = [];
+    const hooks: RuntimeHooks = { diagnostic: event => events.push(event) };
+    const executor = new BatchExecutor(adapter(copy), options({ batchSize: 4, maxRetries: 4 }), hooks);
     await expect(executor.execute([item(1), item(2), item(3)], () => undefined, failed)).rejects.toBeInstanceOf(PauseError);
     expect(copy).toHaveBeenCalledTimes(1);
     expect(failed).not.toHaveBeenCalled();
+    expect(hooks.requestContext).toBeUndefined();
+    expect(events.at(-1)).toMatchObject({ outcome: 'paused', folderId: 10, targetFolderId: 20, aids: [1, 2, 3] });
+    expect(events.at(-1)).not.toHaveProperty('endpoint');
+  });
+
+  it('records the actual retry wait and batch IDs without inventing an HTTP endpoint', async () => {
+    const events: DiagnosticEvent[] = [];
+    const waits: number[] = [];
+    let attempts = 0;
+    const copy = adapter(async () => { if (++attempts === 1) throw new AppError('temporary', 'network', 503, true); });
+    await new BatchExecutor(copy, options({ delayMs: 100, cooldownMs: 9000, maxRetries: 1 }), {
+      diagnostic: event => events.push(event), sleep: async ms => { waits.push(ms); },
+    }).execute([item(1), item(2)], () => undefined, () => undefined);
+    expect(events.find(event => event.outcome === 'retry-wait')).toMatchObject({ waitMs: waits[0], aids: [1, 2], folderId: 10, targetFolderId: 20 });
+    expect(waits[0]).toBeGreaterThanOrEqual(70);
+    expect(waits[0]).toBeLessThanOrEqual(130);
+    expect(events.every(event => event.endpoint === undefined && event.status === undefined)).toBe(true);
   });
 
   it('does not repeat a remote copy when a durable success callback fails', async () => {

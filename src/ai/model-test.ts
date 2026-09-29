@@ -1,5 +1,5 @@
 import { DEFAULT_SETTINGS } from '../defaults';
-import type { AISettings, CategoryDefinition, VideoRecord } from '../types';
+import type { AISettings, CategoryDefinition, RuntimeHooks, VideoRecord } from '../types';
 import { AppError } from '../lib/errors';
 import { buildSystemPrompt, buildUserPrompt, parseClassificationBatch } from './classifier';
 import { defaultAIProvider, type AIProvider } from './provider';
@@ -31,7 +31,7 @@ const samples = [
 ];
 
 /** One small synthetic batch exercises the production request and strict result parser. */
-export async function testModel(settings: AISettings, provider: AIProvider = defaultAIProvider): Promise<ModelTestResult> {
+export async function testModel(settings: AISettings, provider: AIProvider = defaultAIProvider, hooks: RuntimeHooks = {}): Promise<ModelTestResult> {
   const videos: VideoRecord[] = samples.map(sample => ({
     aid: sample.aid, title: sample.title, description: sample.description, tags: sample.tags,
     sourceFolderIds: [], primarySourceFolderId: 0, metadataFetchedAt: '2026-09-28T00:00:00.000Z',
@@ -39,12 +39,19 @@ export async function testModel(settings: AISettings, provider: AIProvider = def
   const system = buildSystemPrompt(DEFAULT_SETTINGS.prompt, categories);
   const user = buildUserPrompt(videos, categories);
   const started = Date.now();
-  const response = provider === defaultAIProvider
-    ? await defaultAIProvider.completeWithMetadata(system, user, settings)
-    : { content: await provider.complete(system, user, settings), model: settings.model, usage: undefined };
+  let response;
+  try {
+    response = provider === defaultAIProvider
+      ? await defaultAIProvider.completeWithMetadata(system, user, settings, hooks)
+      : { content: await provider.complete(system, user, settings), model: settings.model, usage: undefined };
+  } catch (error) {
+    hooks.diagnostic?.({ task: 'model-test', phase: 'ai-test', outcome: 'request-error', method: 'POST', endpoint: '/chat/completions', durationMs: Date.now() - started, status: error instanceof AppError ? error.code : undefined, reason: error instanceof AppError ? error.kind : 'network' });
+    throw error;
+  }
   let parsed;
   try { parsed = parseClassificationBatch(response.content, videos, categories, 0); }
-  catch { throw new AppError('模型调用成功，但分类格式不合格：需完整返回 3 个视频、有效类别与 0–1 置信度', 'invalid'); }
+  catch { hooks.diagnostic?.({ task: 'model-test', phase: 'ai-test', outcome: 'output-invalid', method: 'POST', endpoint: '/chat/completions', durationMs: Date.now() - started }); throw new AppError('模型调用成功，但分类格式不合格：需完整返回 3 个视频、有效类别与 0–1 置信度', 'invalid'); }
+  hooks.diagnostic?.({ task: 'model-test', phase: 'ai-test', outcome: 'completed', method: 'POST', endpoint: '/chat/completions', durationMs: Date.now() - started });
   return {
     testedAt: new Date().toISOString(), elapsedMs: Date.now() - started,
     correct: parsed.filter(result => samples.find(sample => sample.aid === result.aid)?.category === result.category).length,

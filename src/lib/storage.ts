@@ -1,11 +1,15 @@
-import type { AppData, Repository, Settings, ExecutionState } from '../types';
+import type { AppData, Repository, Settings, ExecutionState, DiagnosticEvent } from '../types';
 import { DEFAULT_SETTINGS } from '../defaults';
 import { gmGetValue, gmSetValue } from './gm';
 import { AppError } from './errors';
 import legacyPrompt from '../prompts/classifier-legacy.txt?raw';
+import formerDefaultPrompt from '../prompts/classifier-v1.txt?raw';
 
 const DATA_KEY = 'bilfav-select:data:v1';
 const SETTINGS_KEY = 'bilfav-select:settings:v1';
+const DIAGNOSTICS_KEY = 'bilfav-select:diagnostics:v1';
+export function loadDiagnostics(): { events: DiagnosticEvent[]; truncated: boolean } { return gmGetValue(DIAGNOSTICS_KEY, { events: [], truncated: false }); }
+export function saveDiagnostics(events: DiagnosticEvent[], truncated = false): void { gmSetValue(DIAGNOSTICS_KEY, { events: events.slice(-5000), truncated }); }
 export function emptyExecution(): ExecutionState {
   return { runId: null, manifestHash: null, phase: 'idle', targetFolderIds: {}, copiedAids: [],
     pendingAids: [], failedItems: [], retryCount: 0, sourceBefore: {} };
@@ -27,7 +31,8 @@ export class GMRepository implements Repository {
 export function loadSettings(): Settings {
   const result = { ...structuredClone(DEFAULT_SETTINGS), ...gmGetValue<Partial<Settings>>(SETTINGS_KEY, {}) };
   // Replace only the exact former built-in prompt; preserve all user-written prompts and tables.
-  if (result.prompt.replace(/\r\n/g, '\n').trim() === legacyPrompt.replace(/\r\n/g, '\n').trim()) {
+  const normalizedPrompt = result.prompt.replace(/\r\n/g, '\n').trim();
+  if ([legacyPrompt, formerDefaultPrompt].some(oldPrompt => normalizedPrompt === oldPrompt.replace(/\r\n/g, '\n').trim())) {
     result.prompt = DEFAULT_SETTINGS.prompt;
   }
   return result;

@@ -199,7 +199,7 @@ describe('classifyDataset', () => {
     expect(manifest).toMatchObject({
       datasetVersion: 3,
       datasetUpdatedAt: '2026-09-27T18:30:00.000Z',
-      promptVersion: 1,
+      promptVersion: 2,
       results: [expect.objectContaining({ aid: 17, category: '电影', confidence: 0.9 })],
     });
     expect(manifest.stats).toEqual({ 电影: 1, 知识: 0, 不确定: 0 });

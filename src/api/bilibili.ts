@@ -214,6 +214,8 @@ export class HttpBilibiliAdapter implements BilibiliAdapter {
     return folders;
   }
 
+  async refreshFolders(): Promise<Folder[]> { this.folderCache = undefined; return this.listFolders(); }
+
   async renameFolder(id: FolderId, title: string): Promise<void> {
     const user = await this.getCurrentUser();
     const folder = await this.assertOwnedFolder(id, user.mid, true);
@@ -491,6 +493,8 @@ export class HttpBilibiliAdapter implements BilibiliAdapter {
   isVideoUnavailable(aid: number): boolean {
     return this.unavailableAids.has(aid);
   }
+
+  beginRefreshTask(): void { this.unavailableAids.clear(); }
 
   private async reconcileFolderResources(id: FolderId, resources: FolderResource[], expectedCount: number): Promise<void> {
     // media_count may include hidden unavailable entries. Do not use a count

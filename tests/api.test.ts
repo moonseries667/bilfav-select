@@ -6,7 +6,7 @@ import { Workflow } from '../src/core/workflow';
 import { createInitialData } from '../src/lib/storage';
 import { DEFAULT_SETTINGS } from '../src/defaults';
 import { classifyDataset } from '../src/ai/classifier';
-import type { AppData } from '../src/types';
+import type { AppData, DiagnosticEvent } from '../src/types';
 
 type Call = { url: string; options: BilibiliRequestOptions };
 type MockResult = { status?: number; body?: unknown; responseText?: string; reject?: boolean };
@@ -38,6 +38,20 @@ const jsonBody = (call: Call): URLSearchParams => new URLSearchParams(call.optio
 afterEach(() => vi.unstubAllGlobals());
 
 describe('HttpBilibiliAdapter', () => {
+  it('forces an authoritative folder read even while the folder cache is fresh', async () => {
+    let title = 'before';
+    const { mock, calls } = transport(url => {
+      if (url.includes('/x/web-interface/nav')) return { body: loggedIn() };
+      if (url.includes('/created/list-all')) return { body: folderList([folder(88, 2, { title })]) };
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    const adapter = new HttpBilibiliAdapter(settings(), {}, mock);
+    await adapter.listFolders();
+    title = 'after';
+    expect((await adapter.refreshFolders())[0].title).toBe('after');
+    expect(calls.filter(call => call.url.includes('/created/list-all'))).toHaveLength(2);
+  });
+
   it('uses nav mid and attr default marker instead of titles or fid guesses', async () => {
     const { mock, calls } = transport(url => {
       if (url.includes('/x/web-interface/nav')) return { body: loggedIn() };
@@ -327,6 +341,23 @@ describe('HttpBilibiliAdapter', () => {
     expect(JSON.stringify(log.mock.calls)).not.toContain('untrusted echoed text');
   });
 
+  it('clears cached unavailable status at the start of a new refresh task', async () => {
+    let unavailable = true;
+    const { mock, calls } = transport(url => {
+      if (url.includes('/view?aid=99')) return unavailable ? { body: { code: -404, data: null } } : { body: ok({ aid: 99, title: 'available again' }) };
+      if (url.includes('/view/detail/tag?aid=99')) return { body: ok([{ tag_name: 'tag' }]) };
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    const adapter = new HttpBilibiliAdapter(settings(), {}, mock);
+    await adapter.getVideoMetadata(99);
+    expect(adapter.isVideoUnavailable(99)).toBe(true);
+    unavailable = false;
+    adapter.beginRefreshTask();
+    expect(adapter.isVideoUnavailable(99)).toBe(false);
+    await expect(adapter.getVideoMetadata(99)).resolves.toMatchObject({ aid: 99, tags: ['tag'] });
+    expect(calls).toHaveLength(3);
+  });
+
   it.each([62002, 62004, 62012])('skips a video that becomes unavailable with code %i during its tags request', async code => {
     const { mock, calls } = transport(url => {
       if (url.includes('/view?aid=99')) return { body: ok({ aid: 99, title: 'previously visible' }) };
@@ -452,17 +483,25 @@ describe('HttpBilibiliAdapter', () => {
   it('retries a temporary GET 5xx response within the configured retry limit', async () => {
     let attempts = 0;
     const waits: number[] = [];
+    const events: DiagnosticEvent[] = [];
+    const statuses: string[] = [];
     const { mock } = transport(url => {
       if (!url.includes('/x/web-interface/nav')) throw new Error(`Unexpected URL: ${url}`);
       attempts++;
       if (attempts === 1) return { status: 503, body: {} };
       return { body: loggedIn() };
     });
-    const adapter = new HttpBilibiliAdapter(settings(), { sleep: async ms => { waits.push(ms); } }, mock);
+    const adapter = new HttpBilibiliAdapter(settings(), {
+      sleep: async ms => { waits.push(ms); }, diagnostic: event => events.push(event), statusMessage: message => statuses.push(message),
+    }, mock);
 
     await expect(adapter.getCurrentUser()).resolves.toEqual({ mid: 7, name: 'tester' });
     expect(attempts).toBe(2);
     expect(waits.length).toBeGreaterThan(0);
+    expect(events.find(event => event.phase === 'bilibili-wait')).toMatchObject({ waitMs: waits[0] });
+    expect(statuses[0]).toContain('请求等待');
+    expect(statuses[0]).not.toContain('限流');
+    expect(events.find(event => event.outcome === 'http-error')).toMatchObject({ endpoint: '/x/web-interface/nav', status: 503 });
   });
 
   it('accepts a null resource list only for a confirmed empty folder', async () => {

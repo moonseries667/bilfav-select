@@ -20,7 +20,7 @@ export function validateManifest(input: unknown, dataset?: VideoDataset): Classi
   if (typeof obj.createdAt !== 'string' || !Number.isFinite(Date.parse(obj.createdAt))) fail('创建时间不合法');
   if (!Number.isSafeInteger(obj.datasetVersion) || Number(obj.datasetVersion) < 1 || typeof obj.datasetUpdatedAt !== 'string' || !Number.isFinite(Date.parse(obj.datasetUpdatedAt))) fail('数据集标识不合法');
   if (typeof obj.confidenceThreshold !== 'number' || !Number.isFinite(obj.confidenceThreshold) || obj.confidenceThreshold < 0 || obj.confidenceThreshold > 1) fail('阈值不合法');
-  if (obj.promptVersion !== 1 || typeof obj.prompt !== 'string') fail('Prompt 信息不合法');
+  if ((obj.promptVersion !== 1 && obj.promptVersion !== 2) || typeof obj.prompt !== 'string') fail('Prompt 信息不合法');
   if (!Array.isArray(obj.categories) || !obj.categories.length) fail('分类表为空');
   const names = new Set<string>();
   const unsafe = new Set(['__proto__', 'constructor', 'prototype']);
@@ -57,6 +57,6 @@ export function validateManifest(input: unknown, dataset?: VideoDataset): Classi
     version: 1, runId: obj.runId as string, createdAt: obj.createdAt as string,
     datasetVersion: obj.datasetVersion as number, datasetUpdatedAt: obj.datasetUpdatedAt as string,
     categories: (obj.categories as { name: string; description: string }[]).map(c => ({ name: c.name, description: c.description })),
-    confidenceThreshold: obj.confidenceThreshold as number, promptVersion: 1, prompt: obj.prompt as string, results, stats,
+    confidenceThreshold: obj.confidenceThreshold as number, promptVersion: obj.promptVersion as number, prompt: obj.prompt as string, results, stats,
   };
 }

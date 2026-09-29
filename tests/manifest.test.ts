@@ -18,6 +18,11 @@ describe('Manifest boundary and recovery fingerprint', () => {
     const manifest = fixture(); manifest.stats = { '电影': 999 };
     expect(validateManifest(manifest, dataset).stats).toEqual({ '电影': 1, '不确定': 0 });
   });
+  it('accepts both prompt generations and preserves the imported version in normalized manifests', () => {
+    const legacy = validateManifest(fixture(), dataset);
+    expect(legacy.promptVersion).toBe(1);
+    expect(validateManifest({ ...fixture(), promptVersion: 2 }, dataset).promptVersion).toBe(2);
+  });
   it('rejects duplicate, foreign or missing aids before apply', () => {
     const manifest = fixture(); manifest.results.push(manifest.results[0]);
     expect(() => validateManifest(manifest, dataset)).toThrow('aid');

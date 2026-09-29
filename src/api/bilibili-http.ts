@@ -92,6 +92,7 @@ export class BilibiliHttpClient {
     for (let attempt = 0; attempt <= retries; attempt++) {
       this.hooks.checkpoint?.();
       await this.waitBeforeRequest();
+      const startedAt = Date.now();
 
       let response: Pick<GMXMLHttpResponse, 'status' | 'responseText'>;
       try {
@@ -109,6 +110,7 @@ export class BilibiliHttpClient {
           anonymous: false,
         });
       } catch (error) {
+        this.hooks.diagnostic?.({ task: this.hooks.currentTask?.() ?? 'bilibili', phase: 'bilibili-http', outcome: 'network-error', ...this.hooks.requestContext, method, endpoint: safePath(url), durationMs: Date.now() - startedAt, attempt: attempt + 1, reason: error instanceof AppError ? error.kind : 'network' });
         if (error instanceof PauseError || (error instanceof AppError && error.kind === 'paused')) throw error;
         const timedOut = error instanceof AppError && error.code === 408;
         if (retryNetwork && attempt < retries) {
@@ -118,10 +120,12 @@ export class BilibiliHttpClient {
         }
         throw new AppError(timedOut ? 'B 站请求超时（单次 30 秒），已停止；请检查连接后重试' : 'B 站网络请求失败，请检查连接后重试', 'network', timedOut ? 408 : undefined, retryNetwork);
       }
+      this.hooks.diagnostic?.({ task: this.hooks.currentTask?.() ?? 'bilibili', phase: 'bilibili-http', outcome: response.status >= 200 && response.status < 300 ? 'http-response' : 'http-error', ...this.hooks.requestContext, method, endpoint: safePath(url), durationMs: Date.now() - startedAt, status: response.status, attempt: attempt + 1 });
 
       if (response.status === 412 || response.status === 429) {
         const error = new AppError('B 站请求触发限流，已进入冷却', 'rate-limit', response.status, true);
         this.scheduleCooldown(attempt);
+        this.hooks.diagnostic?.({ task: this.hooks.currentTask?.() ?? 'bilibili', phase: 'bilibili-http', outcome: 'rate-limited', ...this.hooks.requestContext, method, endpoint: safePath(url), durationMs: Date.now() - startedAt, status: response.status, attempt: attempt + 1, waitMs: this.pendingWaitMs, reason: 'http-throttle' });
         if (attempt < retries) {
           this.hooks.log?.('B 站请求触发限流，等待冷却后重试', 'warning');
           continue;
@@ -154,14 +158,17 @@ export class BilibiliHttpClient {
       try {
         envelope = JSON.parse(response.responseText) as BilibiliEnvelope<T>;
       } catch {
+        this.hooks.diagnostic?.({ task: this.hooks.currentTask?.() ?? 'bilibili', phase: 'bilibili-http', outcome: 'invalid-json', ...this.hooks.requestContext, method, endpoint: safePath(url), durationMs: Date.now() - startedAt, status: response.status, attempt: attempt + 1 });
         throw new AppError('B 站返回了无法解析的响应', 'api', undefined, false);
       }
       if (!envelope || typeof envelope !== 'object' || !Number.isInteger(envelope.code)) {
+        this.hooks.diagnostic?.({ task: this.hooks.currentTask?.() ?? 'bilibili', phase: 'bilibili-http', outcome: 'invalid-envelope', ...this.hooks.requestContext, method, endpoint: safePath(url), durationMs: Date.now() - startedAt, status: response.status, attempt: attempt + 1 });
         throw new AppError('B 站返回了不完整的响应', 'api', undefined, false);
       }
 
       if (RATE_LIMIT_CODES.has(envelope.code)) {
         this.scheduleCooldown(attempt);
+        this.hooks.diagnostic?.({ task: this.hooks.currentTask?.() ?? 'bilibili', phase: 'bilibili-http', outcome: 'rate-limited', ...this.hooks.requestContext, method, endpoint: safePath(url), durationMs: Date.now() - startedAt, status: response.status, apiCode: envelope.code, attempt: attempt + 1, waitMs: this.pendingWaitMs, reason: 'api-throttle' });
         if (attempt < retries) {
           this.hooks.log?.('B 站请求触发限流，等待冷却后重试', 'warning');
           continue;
@@ -170,9 +177,11 @@ export class BilibiliHttpClient {
       }
 
       if (envelope.code !== 0 && !options.acceptedCodes?.includes(envelope.code)) {
+        this.hooks.diagnostic?.({ task: this.hooks.currentTask?.() ?? 'bilibili', phase: 'bilibili-http', outcome: 'api-error', ...this.hooks.requestContext, method, endpoint: safePath(url), durationMs: Date.now() - startedAt, status: response.status, apiCode: envelope.code, attempt: attempt + 1 });
         const kind = envelope.code === -404 || envelope.code === 11010 ? 'unavailable' : 'api';
         throw new AppError(`B 站 API 请求失败（code ${envelope.code}）`, kind, envelope.code, false);
       }
+      this.hooks.diagnostic?.({ task: this.hooks.currentTask?.() ?? 'bilibili', phase: 'bilibili-http', outcome: 'api-success', ...this.hooks.requestContext, method, endpoint: safePath(url), durationMs: Date.now() - startedAt, status: response.status, apiCode: envelope.code, attempt: attempt + 1 });
       return envelope;
     }
 
@@ -186,7 +195,11 @@ export class BilibiliHttpClient {
     }
     const pending = this.pendingWaitMs;
     this.pendingWaitMs = 0;
-    if (pending > 0) await this.wait(pending);
+    if (pending > 0) {
+      this.hooks.statusMessage?.(`B 站请求等待 ${Math.ceil(pending / 1000)} 秒后继续`);
+      this.hooks.diagnostic?.({ task: this.hooks.currentTask?.() ?? 'bilibili', phase: 'bilibili-wait', outcome: 'retry-wait', ...this.hooks.requestContext, waitMs: pending });
+      await this.wait(pending);
+    }
     this.hooks.checkpoint?.();
   }
 
@@ -210,3 +223,5 @@ export class BilibiliHttpClient {
     return this.hooks.sleep ? this.hooks.sleep(ms) : new Promise(resolve => setTimeout(resolve, ms));
   }
 }
+
+function safePath(url: string): string { try { return new URL(url).pathname; } catch { return '/unknown'; } }

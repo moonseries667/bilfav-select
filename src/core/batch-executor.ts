@@ -47,13 +47,20 @@ export class BatchExecutor {
 
     for (let attempt = 0; attempt <= retries; attempt++) {
       this.checkpoint();
+      const startedAt = Date.now();
+      const context = { folderId: items[0].sourceId, targetFolderId: items[0].targetId,
+        aid: items.length === 1 ? items[0].aid : undefined, aids: items.map(item => item.aid) };
+      this.hooks.requestContext = { folderId: items[0].sourceId, targetFolderId: items[0].targetId, ...(items.length === 1 ? { aid: items[0].aid } : {}) };
+      this.hooks.diagnostic?.({ task: this.hooks.currentTask?.() ?? 'apply', phase: 'copy-batch', outcome: 'started', ...context, attempt: attempt + 1 });
       try {
         await this.adapter.copyVideos(items[0].sourceId, items[0].targetId, items.map(item => item.aid));
       } catch (error) {
+        delete this.hooks.requestContext;
+        this.hooks.diagnostic?.({ task: this.hooks.currentTask?.() ?? 'apply', phase: 'copy-batch', outcome: isPause(error) ? 'paused' : 'failed', ...context, durationMs: Date.now() - startedAt, attempt: attempt + 1, reason: error instanceof AppError ? error.kind : 'network' });
         if (isPause(error)) throw error;
         lastError = error;
         if (attempt < retries) this.retries++;
-        await this.waitAfterFailure(error, attempt < retries);
+        await this.waitAfterFailure(error, attempt < retries, items);
         if (attempt < retries) continue;
 
         if (items.length > 1) {
@@ -66,6 +73,9 @@ export class BatchExecutor {
         await onFailure(items[0], errorMessage(lastError), attempt + 1);
         return;
       }
+      delete this.hooks.requestContext;
+
+      this.hooks.diagnostic?.({ task: this.hooks.currentTask?.() ?? 'apply', phase: 'copy-batch', outcome: 'completed', ...context, durationMs: Date.now() - startedAt, attempt: attempt + 1 });
 
       // A callback failure must propagate. The remote copy may already have
       // succeeded, so treating it as an API failure could duplicate work.
@@ -75,14 +85,15 @@ export class BatchExecutor {
     }
   }
 
-  private async waitAfterFailure(error: unknown, retrying: boolean): Promise<void> {
+  private async waitAfterFailure(error: unknown, retrying: boolean, items: CopyItem[]): Promise<void> {
     const baseDelay = Math.max(0, this.options.delayMs);
     const cooldown = Math.max(0, this.options.cooldownMs);
-    if (isRateLimited(error)) {
-      if (cooldown > 0) await this.pause(jitter(cooldown));
-      else if (retrying && baseDelay > 0) await this.pause(jitter(baseDelay));
-    } else if (retrying && baseDelay > 0) {
-      await this.pause(jitter(baseDelay));
+    const configured = isRateLimited(error) && cooldown > 0 ? cooldown : retrying ? baseDelay : 0;
+    if (configured > 0) {
+      const waitMs = jitter(configured);
+      this.hooks.diagnostic?.({ task: this.hooks.currentTask?.() ?? 'apply', phase: 'copy-batch', outcome: 'retry-wait',
+        folderId: items[0].sourceId, targetFolderId: items[0].targetId, aids: items.map(item => item.aid), waitMs });
+      await this.pause(waitMs);
     }
   }
 

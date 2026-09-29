@@ -15,7 +15,7 @@ export default defineConfig(({ command }) => ({
       name: 'Bilibili 收藏夹语义重建器',
       namespace: 'bilfav-select',
       version: scriptVersion,
-      description: '按兴趣分类表重建收藏，支持模型获取与测试、重复分类和中断恢复。',
+      description: '按分类表重建收藏，支持完整与增量获取、有效模型选择、任务续传和诊断日志导出。',
       author: 'Bilfav Select contributors; based on madoka-chann',
       license: 'MIT',
       match: ['https://space.bilibili.com/*'],

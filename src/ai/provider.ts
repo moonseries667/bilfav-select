@@ -3,10 +3,10 @@
  */
 import { gmFetch } from '../lib/gm';
 import { AppError } from '../lib/errors';
-import type { AISettings } from '../types';
+import type { AISettings, RuntimeHooks } from '../types';
 
 export interface AIProvider {
-  complete(system: string, user: string, settings: AISettings): Promise<string>;
+  complete(system: string, user: string, settings: AISettings, hooks?: RuntimeHooks): Promise<string>;
 }
 
 export interface AIRequest {
@@ -72,30 +72,36 @@ function statusError(status: number, operation: '模型列表' | 'AI'): AppError
 }
 
 /** Lists model identifiers from the provider's OpenAI-compatible /models endpoint. */
-export async function fetchModels(settings: AISettings): Promise<string[]> {
+export async function fetchModels(settings: AISettings, hooks: RuntimeHooks = {}): Promise<string[]> {
   const parsed = getBaseUrl(settings);
   const headers = getHeaders(settings);
   const url = `${parsed.origin}${parsed.pathname.replace(/\/+$/, '')}/models`;
   let response;
+  const startedAt = Date.now();
+  const endpoint = new URL(url).pathname;
   try {
     response = await gmFetch(url, { method: 'GET', headers, timeout: REQUEST_TIMEOUT_MS, anonymous: true });
   } catch (error) {
+    hooks.diagnostic?.({ task: 'models', phase: 'model-list', outcome: 'network-error', method: 'GET', endpoint, durationMs: Date.now() - startedAt, reason: error instanceof AppError ? error.kind : 'network' });
     throw safeRequestError(error, '模型列表');
   }
-  if (response.status < 200 || response.status >= 300) throw statusError(response.status, '模型列表');
+  if (response.status < 200 || response.status >= 300) { hooks.diagnostic?.({ task: 'models', phase: 'model-list', outcome: 'http-error', method: 'GET', endpoint, durationMs: Date.now() - startedAt, status: response.status }); throw statusError(response.status, '模型列表'); }
 
   let envelope: unknown;
   try {
     envelope = JSON.parse(response.responseText) as unknown;
   } catch {
+    hooks.diagnostic?.({ task: 'models', phase: 'model-list', outcome: 'invalid-json', method: 'GET', endpoint, durationMs: Date.now() - startedAt, status: response.status });
     throw new AppError('模型列表响应格式无效', 'invalid');
   }
   if (!isRecord(envelope) || !Array.isArray(envelope.data) ||
       envelope.data.some(item => !isRecord(item) || typeof item.id !== 'string')) {
-    throw new AppError('模型列表响应格式无效', 'invalid');
+    { hooks.diagnostic?.({ task: 'models', phase: 'model-list', outcome: 'invalid-shape', method: 'GET', endpoint, durationMs: Date.now() - startedAt, status: response.status }); throw new AppError('模型列表响应格式无效', 'invalid'); }
   }
-  return [...new Set(envelope.data.map(item => (item as Record<string, unknown>).id as string)
+  const models = [...new Set(envelope.data.map(item => (item as Record<string, unknown>).id as string)
     .map(id => id.trim()).filter(Boolean))];
+  hooks.diagnostic?.({ task: 'models', phase: 'model-list', outcome: models.length ? 'completed' : 'empty', method: 'GET', endpoint, durationMs: Date.now() - startedAt, status: response.status });
+  return models;
 }
 
 /** Builds the standard chat-completions request shared by OpenAI, DeepSeek and Ollama. */
@@ -122,17 +128,19 @@ export function buildAIRequest(system: string, user: string, settings: AISetting
 }
 
 export class OpenAICompatibleProvider implements AIProvider {
-  async complete(system: string, user: string, settings: AISettings): Promise<string> {
-    return (await this.completeWithMetadata(system, user, settings)).content;
+  async complete(system: string, user: string, settings: AISettings, hooks: RuntimeHooks = {}): Promise<string> {
+    return (await this.completeWithMetadata(system, user, settings, hooks)).content;
   }
 
-  async completeWithMetadata(system: string, user: string, settings: AISettings): Promise<{
+  async completeWithMetadata(system: string, user: string, settings: AISettings, hooks: RuntimeHooks = {}): Promise<{
     content: string;
     model?: string;
     usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number };
   }> {
     const request = buildAIRequest(system, user, settings);
     let response;
+    const startedAt = Date.now();
+    const endpoint = new URL(request.url).pathname;
     try {
       response = await gmFetch(request.url, {
         method: request.method,
@@ -142,23 +150,27 @@ export class OpenAICompatibleProvider implements AIProvider {
         anonymous: true,
       });
     } catch (error) {
+      hooks.diagnostic?.({ task: hooks.currentTask?.() ?? 'ai', phase: 'ai-http', outcome: 'network-error', method: 'POST', endpoint, durationMs: Date.now() - startedAt, status: error instanceof AppError ? error.code : undefined, reason: error instanceof AppError ? error.kind : 'network' });
       throw safeRequestError(error, 'AI');
     }
 
     if (response.status < 200 || response.status >= 300) {
+      hooks.diagnostic?.({ task: hooks.currentTask?.() ?? 'ai', phase: 'ai-http', outcome: 'http-error', method: 'POST', endpoint, durationMs: Date.now() - startedAt, status: response.status });
       throw statusError(response.status, 'AI');
     }
+    hooks.diagnostic?.({ task: hooks.currentTask?.() ?? 'ai', phase: 'ai-http', outcome: 'http-response', method: 'POST', endpoint, durationMs: Date.now() - startedAt, status: response.status });
 
     let envelope: unknown;
     try {
       envelope = JSON.parse(response.responseText) as unknown;
     } catch {
+      hooks.diagnostic?.({ task: hooks.currentTask?.() ?? 'ai', phase: 'ai-http', outcome: 'invalid-json', method: 'POST', endpoint, durationMs: Date.now() - startedAt, status: response.status });
       throw new AppError('AI 服务响应不是有效 JSON', 'invalid');
     }
 
     const content = getMessageContent(envelope);
-    if (content === null) throw new AppError('AI 服务响应缺少有效的 choices 内容', 'invalid');
-    if (!content.trim()) throw new AppError('AI 服务返回了空内容', 'invalid');
+    if (content === null) { hooks.diagnostic?.({ task: hooks.currentTask?.() ?? 'ai', phase: 'ai-http', outcome: 'invalid-shape', method: 'POST', endpoint, durationMs: Date.now() - startedAt, status: response.status }); throw new AppError('AI 服务响应缺少有效的 choices 内容', 'invalid'); }
+    if (!content.trim()) { hooks.diagnostic?.({ task: hooks.currentTask?.() ?? 'ai', phase: 'ai-http', outcome: 'empty-content', method: 'POST', endpoint, durationMs: Date.now() - startedAt, status: response.status }); throw new AppError('AI 服务返回了空内容', 'invalid'); }
     return {
       content,
       ...(isRecord(envelope) && typeof envelope.model === 'string' ? { model: envelope.model } : {}),

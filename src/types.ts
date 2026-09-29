@@ -123,6 +123,8 @@ export interface AppData {
   dataset?: VideoDataset;
   manifest?: ClassificationManifest;
   classificationDraft?: ClassificationDraft;
+  refreshDraft?: { signature: string; mode: RefreshMode; baseVersion: number; baseUpdatedAt: string; completed: VideoRecord[] };
+  refreshSummary?: { mode: RefreshMode; completedAt: string; fetched: number; reused: number; excluded: number; total: number };
 }
 export interface AISettings {
   provider: 'openai-compatible' | 'deepseek' | 'ollama';
@@ -143,6 +145,8 @@ export interface Settings extends AISettings {
   metadataCacheTtlMs: number;
 }
 export interface BilibiliAdapter {
+  beginRefreshTask?(): void;
+  refreshFolders?(): Promise<Folder[]>;
   getCurrentUser(): Promise<{ mid: number; name: string }>;
   listFolders(): Promise<Folder[]>;
   renameFolder(id: FolderId, title: string): Promise<void>;
@@ -163,7 +167,13 @@ export interface RuntimeHooks {
   log?: (message: string, level?: 'info' | 'warning' | 'error') => void;
   sleep?: (ms: number) => Promise<void>;
   now?: () => Date;
+  diagnostic?: (event: DiagnosticEvent) => void;
+  currentTask?: () => string;
+  requestContext?: { folderId?: number; targetFolderId?: number; aid?: number };
+  statusMessage?: (message: string) => void;
 }
+export interface DiagnosticEvent { at?: string; task: string; phase: string; outcome?: string; folderId?: number; targetFolderId?: number; aid?: number; aids?: number[]; method?: string; endpoint?: string; durationMs?: number; status?: number; apiCode?: number; attempt?: number; waitMs?: number; reason?: string; message?: string }
+export type RefreshMode = 'full' | 'incremental';
 export interface CopyItem { aid: number; category: string; sourceId: FolderId; targetId: FolderId }
 export interface BatchOptions {
   batchSize: number;

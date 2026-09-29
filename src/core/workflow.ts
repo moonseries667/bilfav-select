@@ -3,7 +3,7 @@ import { DEFAULT_SETTINGS } from '../defaults';
 import { AppError, PauseError, errorMessage } from '../lib/errors';
 import { emptyExecution } from '../lib/storage';
 import { manifestHash, validateManifest } from '../lib/manifest';
-import { UNCERTAIN, type AppData, type BilibiliAdapter, type ClassificationManifest, type CopyItem,
+import { UNCERTAIN, type AppData, type BilibiliAdapter, type ClassificationManifest, type CopyItem, type RefreshMode,
   type ExecutionPhase, type Folder, type FolderId, type RuntimeHooks, type Settings, type VerificationReport,
   type VideoDataset, type VideoMetadata, type VideoRecord } from '../types';
 
@@ -21,7 +21,7 @@ export class Workflow {
     this.data = repository.load();
   }
 
-  async freezeSources(): Promise<void> {
+  async freezeSources(options: { maxRetries?: number; cooldownMs?: number } = {}): Promise<void> {
     const state = this.data.state;
     const canBindOwner = !state.ownerMid && !state.sourceFrozen && !state.freezePending && state.sourceFolderIds.length === 0;
     await this.assertOwner(canBindOwner);
@@ -53,15 +53,46 @@ export class Workflow {
       const current = byId.get(snapshot.id);
       if (!current) throw safety(`源收藏夹 ID ${snapshot.id} 在冻结过程中消失`);
       if (current.isDefault) throw safety(`源收藏夹 ID ${snapshot.id} 被识别为默认收藏夹，已停止冻结`);
-      if (snapshot.renamed) continue;
+      if (snapshot.renamed && current.title === snapshot.frozenTitle) { this.progress('freezing', state.sourceFoldersSnapshot.filter(item => item.renamed).length, state.sourceFoldersSnapshot.length, `已确认：${snapshot.frozenTitle}（ID ${snapshot.id}）`); continue; }
 
       // A previous rename may have succeeded even if the page stopped before
       // persisting its acknowledgement. Reconcile by the recorded ID.
       if (current.title !== snapshot.frozenTitle) {
-        await this.adapter.renameFolder(snapshot.id, snapshot.frozenTitle);
+        const retries = Math.max(0, Math.min(5, Math.floor(options.maxRetries ?? DEFAULT_SETTINGS.maxRetries)));
+        for (let attempt = 1; ; attempt++) {
+          this.progress('freezing', state.sourceFoldersSnapshot.filter(item => item.renamed).length, state.sourceFoldersSnapshot.length,
+            `正在冻结 ${state.sourceFoldersSnapshot.filter(item => item.renamed).length + 1}/${state.sourceFoldersSnapshot.length}：${snapshot.originalTitle}（ID ${snapshot.id}）`);
+          try { this.hooks.requestContext = { folderId: snapshot.id }; await this.adapter.renameFolder(snapshot.id, snapshot.frozenTitle); break; }
+          catch (error) {
+            if (!isRetryableRename(error)) throw error;
+            const latest = (await this.refreshFolders()).find(folder => folder.id === snapshot.id);
+            if (!latest) throw safety(`源收藏夹 ID ${snapshot.id} 在改名后消失`);
+            if (latest.title === snapshot.frozenTitle) break;
+            if (attempt > retries) throw error;
+            const waitMs = Math.min(60_000, Math.max(options.cooldownMs ?? 0, 1000 * 2 ** (attempt - 1)));
+            this.hooks.log?.(`改名响应失败，${Math.ceil(waitMs / 1000)} 秒后重试收藏夹 ${snapshot.originalTitle}（ID ${snapshot.id}）`, 'warning');
+            this.hooks.diagnostic?.({ task: 'freeze', phase: 'rename', outcome: 'retry', folderId: snapshot.id, attempt, waitMs, reason: errorMessage(error) });
+            this.progress('freezing', state.sourceFoldersSnapshot.filter(item => item.renamed).length, state.sourceFoldersSnapshot.length, `等待 ${Math.ceil(waitMs / 1000)} 秒后重试：${snapshot.originalTitle}（ID ${snapshot.id}）`);
+            await (this.hooks.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms))))(waitMs);
+          } finally {
+            delete this.hooks.requestContext;
+          }
+        }
       }
       snapshot.renamed = true;
       this.persist();
+      this.progress('freezing', state.sourceFoldersSnapshot.filter(item => item.renamed).length, state.sourceFoldersSnapshot.length, `已冻结：${snapshot.frozenTitle}（ID ${snapshot.id}）`);
+    }
+
+    const confirmed = new Map((await this.refreshFolders()).map(folder => [folder.id, folder]));
+    for (const snapshot of state.sourceFoldersSnapshot) {
+      const folder = confirmed.get(snapshot.id);
+      if (!folder || folder.isDefault || folder.title !== snapshot.frozenTitle) {
+        const target = state.sourceFoldersSnapshot.find(item => item.id === snapshot.id);
+        if (target) target.renamed = false;
+        this.persist();
+        throw safety(`冻结复核失败：${snapshot.originalTitle}（ID ${snapshot.id}）`);
+      }
     }
 
     state.sourceFrozen = true;
@@ -75,13 +106,17 @@ export class Workflow {
     return this.validateSourcesForOwner();
   }
 
-  async refreshDataset(force = true, ttlMs = 86400000): Promise<VideoDataset> {
+  async refreshDataset(modeOrForce: RefreshMode | boolean = 'full', ttlMs = 86400000): Promise<VideoDataset> {
     await this.assertOwner(false);
     await this.validateSourcesForOwner();
 
+    const mode: RefreshMode = typeof modeOrForce === 'boolean' ? (modeOrForce ? 'full' : 'incremental') : modeOrForce;
     const oldDataset = this.data.dataset;
+    const sourceIds = [...this.data.state.sourceFolderIds];
+    const signature = JSON.stringify({ ownerMid: this.data.state.ownerMid, mode, sourceIds, baseVersion: oldDataset?.version ?? 0, baseUpdatedAt: oldDataset?.updatedAt ?? '' });
+    const draft = this.data.refreshDraft?.signature === signature ? this.data.refreshDraft : undefined;
+    this.adapter.beginRefreshTask?.();
     const ttl = Math.max(0, ttlMs);
-    if (!force && oldDataset && this.now().getTime() - Date.parse(oldDataset.updatedAt) < ttl) return oldDataset;
 
     const sourceVideos = new Map<number, { video: { aid: number; bvid?: string; title: string; description?: string; upper?: { mid?: number; name?: string }; duration?: number; unavailable?: boolean }; sourceFolderIds: number[]; primarySourceFolderId: number }>();
     const unavailableAids = new Set<number>();
@@ -91,7 +126,10 @@ export class Workflow {
     for (const sourceId of this.data.state.sourceFolderIds) {
       this.checkpoint();
       this.progress('scanning', foldersRead, this.data.state.sourceFolderIds.length, `正在扫描源收藏夹 ${foldersRead + 1}/${this.data.state.sourceFolderIds.length}（ID ${sourceId}）`);
-      const folderVideos = await this.adapter.listFolderVideos(sourceId);
+      this.hooks.requestContext = { folderId: sourceId };
+      let folderVideos;
+      try { folderVideos = await this.adapter.listFolderVideos(sourceId); }
+      finally { delete this.hooks.requestContext; }
       const seenInFolder = new Set<number>();
       for (const video of folderVideos) {
         if (video.unavailable) {
@@ -113,18 +151,25 @@ export class Workflow {
     this.hooks.log?.(`已扫描 ${foldersRead} 个源收藏夹，去重后 ${sourceVideos.size} 个视频；开始获取详情与完整标签`, 'info');
     const fetchedAt = this.now().toISOString();
     const videos: VideoRecord[] = [];
+    let metadataCompleted = 0;
+    const draftByAid = new Map((draft?.completed ?? []).map(video => [video.aid, video]));
+    const oldByAid = new Map((oldDataset?.videos ?? []).filter(video => !video.unavailable).map(video => [video.aid, video]));
+    let reused = 0, fetched = 0;
+    this.data.refreshDraft = draft ?? { signature, mode, baseVersion: oldDataset?.version ?? 0, baseUpdatedAt: oldDataset?.updatedAt ?? '', completed: [] };
+    this.persist();
     let metadataIndex = 0;
-    for (const [aid, row] of sourceVideos) {
+    try { for (const [aid, row] of sourceVideos) {
       this.checkpoint();
       this.progress('metadata', metadataIndex, sourceVideos.size, `正在处理视频信息 ${++metadataIndex}/${sourceVideos.size}（aid ${aid}）`);
       if (unavailableAids.has(aid) || this.adapter.isVideoUnavailable?.(aid)) {
         unavailableAids.add(aid);
+        metadataCompleted++;
         continue;
       }
-      const cached = oldDataset?.videos.find(video => video.aid === aid);
+      const cached = draftByAid.get(aid) ?? (mode === 'incremental' ? oldByAid.get(aid) : undefined);
       let metadata: VideoMetadata;
       const cachedAt = cached ? Date.parse(cached.metadataFetchedAt) : Number.NaN;
-      const cacheFresh = Boolean(!force && cached && !cached.unavailable && Number.isFinite(cachedAt) && this.now().getTime() - cachedAt < ttl);
+      const cacheFresh = Boolean(cached && !cached.unavailable && Number.isFinite(cachedAt) && (mode === 'incremental' || this.now().getTime() - cachedAt < ttl));
       if (cacheFresh && cached) {
         metadata = {
           aid, bvid: cached.bvid, title: cached.title, description: cached.description,
@@ -132,18 +177,28 @@ export class Workflow {
           upper: cached.upper ? { ...cached.upper } : undefined, duration: cached.duration,
         };
         videos.push({ ...metadata, sourceFolderIds: [...row.sourceFolderIds], primarySourceFolderId: row.primarySourceFolderId, metadataFetchedAt: cached.metadataFetchedAt });
+        reused++;
+        metadataCompleted++;
+        this.hooks.diagnostic?.({ task: 'refresh', phase: 'metadata', outcome: 'reused', aid, folderId: row.primarySourceFolderId });
         continue;
       }
 
+      this.hooks.requestContext = { folderId: row.primarySourceFolderId, aid };
       try {
         metadata = await this.adapter.getVideoMetadata(aid, row.video.bvid);
       } catch (error) {
-        if (!isUnavailable(error)) throw error;
+        if (!isUnavailable(error)) { this.hooks.diagnostic?.({ task: 'refresh', phase: 'metadata', outcome: 'failed', aid, folderId: row.primarySourceFolderId, reason: errorMessage(error) }); throw error; }
         unavailableAids.add(aid);
+        metadataCompleted++;
+        this.hooks.diagnostic?.({ task: 'refresh', phase: 'metadata', outcome: 'unavailable', aid, folderId: row.primarySourceFolderId });
         continue;
+      } finally {
+        delete this.hooks.requestContext;
       }
       if (metadata.unavailable) {
         unavailableAids.add(aid);
+        metadataCompleted++;
+        this.hooks.diagnostic?.({ task: 'refresh', phase: 'metadata', outcome: 'unavailable', aid, folderId: row.primarySourceFolderId });
         continue;
       }
 
@@ -163,18 +218,29 @@ export class Workflow {
         metadataFetchedAt: fetchedAt,
       };
       videos.push(record);
-    }
+      fetched++;
+      metadataCompleted++;
+      this.hooks.diagnostic?.({ task: 'refresh', phase: 'metadata', outcome: 'fetched', aid, folderId: row.primarySourceFolderId });
+      draftByAid.set(aid, record);
+      this.data.refreshDraft.completed = [...draftByAid.values()];
+      if (fetched % 10 === 0) this.persist();
+    } } catch (error) { this.data.refreshDraft.completed = [...draftByAid.values()]; this.persist(); throw error; }
 
-    const dataset: VideoDataset = {
-      version: (oldDataset?.version ?? 0) + 1,
-      updatedAt: this.now().toISOString(),
-      sourceFolderIds: [...this.data.state.sourceFolderIds],
+    const unchanged = mode === 'incremental' && oldDataset && sameDatasetContent(oldDataset.videos, videos) && sameIds(oldDataset.sourceFolderIds, sourceIds);
+    const dataset: VideoDataset = unchanged ? oldDataset : {
+      version: unchanged ? oldDataset.version : (oldDataset?.version ?? 0) + 1,
+      updatedAt: unchanged ? oldDataset.updatedAt : this.now().toISOString(),
+      sourceFolderIds: sourceIds,
       videos,
     };
     this.data.dataset = dataset;
+    this.data.refreshSummary = { mode, completedAt: this.now().toISOString(), fetched, reused, excluded: unavailableAids.size, total: videos.length };
+    delete this.data.refreshDraft;
+    if (!unchanged && this.data.classificationDraft) this.hooks.log?.('视频数据已变化，之前的分类进度不再适用；请重新分类', 'warning');
     this.persist();
     if (unavailableAids.size) this.hooks.log?.(`已跳过 ${unavailableAids.size} 个失效视频，不参与分类或复制`, 'info');
-    this.progress('dataset', videos.length, videos.length, `已更新 ${videos.length} 个唯一视频`);
+    this.hooks.log?.(`获取完成：模式 ${mode}，${mode === 'full' ? '重新获取' : '新增'} ${fetched}，复用 ${reused}，失效/排除 ${unavailableAids.size}，总计 ${videos.length}`, 'info');
+    this.progress('dataset', metadataCompleted, sourceVideos.size, `获取完成：处理 ${metadataCompleted}/${sourceVideos.size}，可用 ${videos.length}，${mode === 'full' ? '重新获取' : '新增'} ${fetched}，复用 ${reused}，排除 ${unavailableAids.size}`);
     return dataset;
   }
 
@@ -645,6 +711,7 @@ export class Workflow {
   }
 
   private checkpoint(): void { this.hooks.checkpoint?.(); }
+  private refreshFolders(): Promise<Folder[]> { return this.adapter.refreshFolders?.() ?? this.adapter.listFolders(); }
   private now(): Date { return this.hooks.now?.() ?? new Date(); }
   private persist(): void { this.repository.save(this.data); }
   private progress(phase: string, completed: number, total: number, message: string): void {
@@ -662,6 +729,22 @@ function uniqueFolders(folders: Folder[]): Folder[] {
 }
 
 function sorted(values: Iterable<number>): number[] { return [...new Set(values)].sort((a, b) => a - b); }
+
+function isRetryableRename(error: unknown): boolean {
+  return error instanceof AppError && (error.retryable || error.kind === 'network' || error.kind === 'rate-limit' || (error.code !== undefined && error.code >= 500));
+}
+function sameIds(a: number[], b: number[]): boolean { return a.length === b.length && a.every((id, index) => id === b[index]); }
+function sameDatasetContent(a: VideoRecord[], b: VideoRecord[]): boolean {
+  if (a.length !== b.length) return false;
+  const byAid = new Map(a.map(video => [video.aid, video]));
+  return b.every(video => {
+    const old = byAid.get(video.aid);
+    if (!old) return false;
+    const { metadataFetchedAt: _oldFetchedAt, ...oldContent } = old;
+    const { metadataFetchedAt: _newFetchedAt, ...newContent } = video;
+    return JSON.stringify(oldContent) === JSON.stringify(newContent);
+  });
+}
 
 function isUnavailable(error: unknown): boolean {
   return error instanceof AppError && error.kind === 'unavailable';

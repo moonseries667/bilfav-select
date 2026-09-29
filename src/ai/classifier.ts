@@ -10,7 +10,7 @@ import { extractJsonValue } from './json';
 import { buildAIRequest, defaultAIProvider } from './provider';
 import type { AIProvider } from './provider';
 
-export const PROMPT_VERSION = 1;
+export const PROMPT_VERSION = 2;
 const MANIFEST_VERSION = 1;
 const MAX_BATCH_SIZE = 50;
 const MAX_RETRIES = 5;
@@ -300,12 +300,24 @@ async function completeWithRetry(
 
   for (let attempt = 1; attempt <= maxRetries + 1; attempt += 1) {
     hooks.checkpoint?.();
+    const startedAt = Date.now();
+    let endpoint = '/chat/completions';
+    try { endpoint = new URL(buildAIRequest(system, user, aiSettings).url).pathname; } catch { /* request validation reports the safe error below */ }
     try {
-      return { results: parse(await provider.complete(system, user, aiSettings)), attempts: attempt };
+      const raw = await provider.complete(system, user, aiSettings, hooks);
+      try {
+        const results = parse(raw);
+        hooks.diagnostic?.({ task: 'classify', phase: 'ai-batch', outcome: 'completed', method: 'POST', endpoint, durationMs: Date.now() - startedAt, attempt });
+        return { results, attempts: attempt };
+      } catch (error) {
+        hooks.diagnostic?.({ task: 'classify', phase: 'ai-batch', outcome: 'output-invalid', method: 'POST', endpoint, durationMs: Date.now() - startedAt, attempt, reason: error instanceof AppError ? error.kind : 'invalid-output' });
+        throw error;
+      }
     } catch (error) {
       if (error instanceof PauseError || (error instanceof AppError && error.kind === 'paused')) throw error;
       const { code, retryable } = getRetryInfo(error);
       if (!retryable || attempt > maxRetries) {
+        hooks.diagnostic?.({ task: 'classify', phase: 'ai-batch', outcome: 'failed', method: 'POST', endpoint, durationMs: Date.now() - startedAt, status: code, attempt, reason: error instanceof AppError ? error.kind : 'network' });
         const codeText = code ? `（HTTP ${code}）` : '';
         const detail = error instanceof AppError ? error.message : 'AI 网络或服务错误';
         throw new AppError(`分类未完成${codeText}：${detail}；已保存完成批次，可继续分类。上一轮收藏夹尚未重建。`,
@@ -319,6 +331,8 @@ async function completeWithRetry(
       const jitteredWait = jitter(waitMs);
       const safeWait = Math.min(120_000,
         code === 412 || code === 429 ? Math.max(configuredCooldown, jitteredWait) : jitteredWait);
+      hooks.diagnostic?.({ task: 'classify', phase: 'ai-batch', outcome: 'retry-wait', method: 'POST', endpoint, durationMs: Date.now() - startedAt, status: code, attempt, waitMs: safeWait, reason: error instanceof AppError ? error.kind : 'network' });
+      hooks.statusMessage?.(`AI 请求或结果校验失败，等待 ${Math.ceil(safeWait / 1000)} 秒后重试（第 ${attempt}/${maxRetries} 次）`);
       hooks.log?.(`AI分类请求或结果校验失败${code ? `（HTTP ${code}）` : ''}，${Math.ceil(safeWait / 1000)} 秒后重试。`, 'warning');
       hooks.checkpoint?.();
       await (hooks.sleep ?? defaultSleep)(safeWait);

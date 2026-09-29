@@ -206,7 +206,7 @@ describe('Workflow source freeze and dataset refresh', () => {
     });
     await workflow.refreshDataset(true);
     expect(updates.filter(value => value.phase === 'metadata').map(value => value.completed)).toEqual([0, 1, 2]);
-    expect(updates.at(-1)).toMatchObject({ phase: 'dataset', completed: 2, total: 2 });
+    expect(updates.at(-1)).toMatchObject({ phase: 'dataset', completed: 3, total: 3 });
     expect(workflow.data.dataset?.videos.map(video => video.aid)).toEqual([101, 103]);
   });
 
@@ -274,6 +274,70 @@ describe('Workflow source freeze and dataset refresh', () => {
     adapter.metadataFailure = { aid: 102, error: new AppError('network down', 'network', undefined, true) };
     await expect(workflow.refreshDataset(true)).rejects.toThrow('network down');
     expect(workflow.data.dataset).toEqual(dataset);
+  });
+
+  it('incremental refresh reads only new details, updates sources, and excludes removed aids', async () => {
+    const adapter = new FakeAdapter();
+    const { workflow, dataset } = await frozenDataset(adapter);
+    adapter.videos.get(10)!.push({ aid: 104, title: 'new' });
+    adapter.videos.get(10)!.splice(adapter.videos.get(10)!.findIndex(video => video.aid === 102), 1);
+    adapter.videos.get(10)!.splice(adapter.videos.get(10)!.findIndex(video => video.aid === 101), 1);
+    const getMetadata = vi.spyOn(adapter, 'getVideoMetadata');
+    const refreshed = await workflow.refreshDataset('incremental');
+    expect(getMetadata.mock.calls.map(call => call[0])).toEqual([104]);
+    expect(refreshed.videos.map(video => video.aid)).toEqual([104, 102, 103]);
+    expect(refreshed.videos.find(video => video.aid === 102)?.sourceFolderIds).toEqual([11]);
+    expect(refreshed.videos.find(video => video.aid === 102)?.primarySourceFolderId).toBe(11);
+    expect(refreshed.videos.some(video => video.aid === 101)).toBe(false);
+    expect(refreshed.version).toBe(dataset.version + 1);
+  });
+
+  it('incremental no-change preserves version and updatedAt and does not refetch metadata', async () => {
+    const { adapter, workflow, dataset } = await frozenDataset();
+    adapter.videos.set(10, [...adapter.videos.get(10)!].reverse());
+    adapter.videos.set(11, [...adapter.videos.get(11)!].reverse());
+    const getMetadata = vi.spyOn(adapter, 'getVideoMetadata');
+    const refreshed = await workflow.refreshDataset('incremental');
+    expect(getMetadata).not.toHaveBeenCalled();
+    expect(refreshed.version).toBe(dataset.version);
+    expect(refreshed.updatedAt).toBe(dataset.updatedAt);
+    expect(refreshed.videos.map(video => video.aid)).toEqual(dataset.videos.map(video => video.aid));
+  });
+
+  it('resumes a full refresh draft after controller-like reload and reuses completed aid details', async () => {
+    const adapter = new FakeAdapter();
+    const repo = new MemoryRepository();
+    const first = await frozenDataset(adapter, repo);
+    adapter.metadataFailure = { aid: 103, error: new AppError('temporary network error', 'network', undefined, true) };
+    await expect(first.workflow.refreshDataset('full')).rejects.toThrow('temporary network error');
+    expect(repo.value.dataset).toEqual(first.dataset);
+    expect(repo.value.refreshDraft?.completed.map(video => video.aid)).toEqual([101, 102]);
+    adapter.metadataFailure = undefined;
+    const resumed = new Workflow(adapter, repo);
+    const fetch = vi.spyOn(adapter, 'getVideoMetadata');
+    await resumed.refreshDataset('full');
+    expect(fetch.mock.calls.map(call => call[0])).toEqual([103]);
+    expect(repo.value.refreshDraft).toBeUndefined();
+  });
+
+  it('does not retry permission failures, but confirms a rename that succeeded before a lost response', async () => {
+    const adapter = new FakeAdapter();
+    const repo = new MemoryRepository();
+    let calls = 0;
+    const rename = adapter.renameFolder.bind(adapter);
+    vi.spyOn(adapter, 'renameFolder').mockImplementation(async (id, title) => {
+      calls++;
+      if (calls === 1) { await rename(id, title); throw new AppError('response lost', 'network', 408, true); }
+      return rename(id, title);
+    });
+    await new Workflow(adapter, repo, { sleep: async () => undefined }).freezeSources({ maxRetries: 2 });
+    expect(calls).toBe(1);
+    expect(repo.value.state.sourceFrozen).toBe(true);
+
+    const denied = new FakeAdapter();
+    vi.spyOn(denied, 'renameFolder').mockRejectedValue(new AppError('permission denied', 'safety'));
+    await expect(new Workflow(denied, new MemoryRepository()).freezeSources({ maxRetries: 3 })).rejects.toThrow('permission denied');
+    expect(denied.renameFolder).toHaveBeenCalledTimes(1);
   });
 
   it('does not treat a metadata schema error as an unavailable video', async () => {
